@@ -1,4 +1,4 @@
- EventScheduler {
+EventScheduler {
 	var <server;
 	var <nodes;
 	var <buses;
@@ -14,7 +14,7 @@
 	var lastScheduledTime;
 	var nextBatchTask;
 
-	*new { |server, maxEvents=500, batchOverlapRatio=0.7, startLag=0.5, debug=false|
+	*new { |server, maxEvents=800, batchOverlapRatio=0.8, startLag=0.5, debug=false|
 		^super.new.init(server, maxEvents, batchOverlapRatio, startLag, debug)
 	}
 
@@ -124,12 +124,19 @@
 	}
 
 	scheduleBatch { |startIdx|
-		var now = SystemClock.seconds;
-		var endIdx = startIdx;
-		var nextBatchTime;
-		var currentEvent;
-		var scheduledCount = 0;
-		var eventTime, absTime, relativeTime, nextBatchDelay;
+		var now, endIdx, nextBatchTime, currentEvent, scheduledCount, skippedCount;
+		var eventTime, absTime, relativeTime, nextBatchDelay, firstEventTime, batchStartTime;
+		var currentBatchStart, batchDuration, overlapTime;
+
+		now = SystemClock.seconds;
+		endIdx = startIdx;
+		scheduledCount = 0;
+		skippedCount = 0;
+		firstEventTime = nil;
+		batchStartTime = now;
+
+		this.log("=== BATCH DEBUG: Starting batch at index % ===".format(startIdx));
+		this.log("Current time: %, Start time: %, Piece time: %".format(now, startTime, now - startTime));
 
 		while({
 			(endIdx < events.size) && { endIdx - startIdx < maxEvents }
@@ -140,27 +147,50 @@
 			absTime = startTime + eventTime;
 			relativeTime = absTime - now;
 
+			if(firstEventTime.isNil) { firstEventTime = eventTime };
+
 			if(relativeTime > 0) {
 				this.scheduleEvent(currentEvent);
 				scheduledCount = scheduledCount + 1;
 				lastScheduledTime = eventTime;
+				// this.log("  Scheduled: idx=%, time=%s, rel=%s".format(endIdx, eventTime, relativeTime));
+			} {
+				skippedCount = skippedCount + 1;
+				// this.log("  SKIPPED: idx=%, time=%s, rel=%s (in past)".format(endIdx, eventTime, relativeTime));
 			};
 
 			endIdx = endIdx + 1;
 		};
 
+		this.log("Batch complete: processed % events, scheduled %, skipped %".format(
+			endIdx - startIdx, scheduledCount, skippedCount));
+		this.log("Event time range: %s to %s (span: %s)".format(
+			firstEventTime, lastScheduledTime, lastScheduledTime - firstEventTime));
+
 		if(endIdx < events.size) {
-			nextBatchTime = startTime + (lastScheduledTime * batchOverlapRatio);
+			currentBatchStart = events[startIdx]["start"].asFloat;
+			batchDuration = lastScheduledTime - currentBatchStart;
+			overlapTime = batchDuration * batchOverlapRatio;
+			nextBatchTime = startTime + currentBatchStart + overlapTime;
 			nextBatchDelay = nextBatchTime - now;
+
+			this.log("Next batch timing: batchStart=%, duration=%, overlap=%".format(
+				currentBatchStart, batchDuration, overlapTime));
+			this.log("Next batch delay: %s (at piece time %s)".format(
+				nextBatchDelay, nextBatchTime - startTime));
 
 			if(nextBatchDelay > 0) {
 				nextBatchTask = SystemClock.sched(nextBatchDelay, {
 					this.scheduleBatch(endIdx);
 					nil;
 				});
+				this.log("Next batch scheduled for %s".format(nextBatchDelay));
 			} {
+				this.log("Next batch delay is negative! Scheduling immediately.");
 				this.scheduleBatch(endIdx);
 			};
+		} {
+			this.log("All events processed!");
 		};
 
 		nextEventIndex = endIdx;
@@ -174,7 +204,7 @@
 		eventTime = event["start"].asFloat;
 		pfields = event["pfields"] ?? { Dictionary.new };
 
-		this.log("Event: % id:% at % sec".format(type, id, eventTime));
+		// this.log("Event: % id:% at % sec".format(type, id, eventTime));
 
 		case
 		{ type == "new" } {
@@ -184,6 +214,9 @@
 		}
 		{ type == "set" } {
 			this.setNode(id, eventTime, pfields);
+		}
+		{ type == "release" }{
+			this.releaseNode(id, eventTime);
 		}
 		{
 			this.log("WARNING: Unknown event type: %".format(type));
@@ -195,7 +228,7 @@
 		var args = this.processPfields(pfields);
 		var group = nodes.at(groupName);
 
-		this.log("Creating synth % (synthName: %) in group %".format(synthId, synthName, groupName));
+		// this.log("Creating synth % (synthName: %) in group %".format(synthId, synthName, groupName));
 
 		SystemClock.schedAbs(absTime, {
 			if(server.serverRunning) {
@@ -204,10 +237,10 @@
 					nodes.put(synthId, synth);
 					nodeWatcher.register(synth);
 
-					this.log("Synth % created with server nodeID %".format(synthId, synth.nodeID));
+					// this.log("Synth % created with server nodeID %".format(synthId, synth.nodeID));
 
 					synth.onFree {
-						this.log("Synth % freed".format(synthId));
+						// this.log("Synth % freed".format(synthId));
 						nodes.removeAt(synthId);
 					};
 				};
@@ -226,10 +259,30 @@
 					var node = nodes.at(nodeId);
 
 					if(node.isNil) {
-						this.log("ERROR: Cannot set node % - node not found at execution time".format(nodeId));
+						// this.log("ERROR: Cannot set node % - node not found at execution time".format(nodeId));
 					} {
-						this.log("Setting node % with args: %".format(nodeId, args));
+						// this.log("Setting node % with args: %".format(nodeId, args));
 						node.set(*args);
+					};
+				};
+			};
+			nil;
+		});
+	}
+
+	releaseNode { |nodeId, eventTime|
+		var absTime = startTime + eventTime;
+
+		SystemClock.schedAbs(absTime, {
+			if(server.serverRunning) {
+				server.bind {
+					var node = nodes.at(nodeId);
+
+					if(node.isNil) {
+						// this.log("ERROR: Cannot set node % - node not found at execution time".format(nodeId));
+					} {
+						// this.log("Relasing node %".format(nodeId));
+						node.release(nil);
 					};
 				};
 			};
