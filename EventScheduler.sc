@@ -190,7 +190,8 @@ EventScheduler {
 				this.scheduleBatch(endIdx);
 			};
 		} {
-			this.log("All events processed!");
+			this.log("All events processed.");
+			// this.stop;
 		};
 
 		nextEventIndex = endIdx;
@@ -217,6 +218,9 @@ EventScheduler {
 		}
 		{ type == "release" }{
 			this.releaseNode(id, eventTime);
+		}
+		{ type == "message" } {
+			// TODO
 		}
 		{
 			this.log("WARNING: Unknown event type: %".format(type));
@@ -311,7 +315,7 @@ EventScheduler {
 		nextEventIndex = 0;
 		lastScheduledTime = 0;
 
-		"Starting playback at %".format(startTime).postln;
+		"Starting playback...".postln;
 
 		this.scheduleBatch(0);
 
