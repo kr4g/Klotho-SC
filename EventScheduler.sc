@@ -14,7 +14,14 @@ EventScheduler {
 	var lastScheduledTime;
 	var nextBatchTask;
 
-	*new { |server, maxEvents=800, batchOverlapRatio=0.8, startLag=0.5, debug=false|
+	var <groupMap;     // \name -> (group, srcGroup, fxGroup, srcBus, fxBus, fxNodes)
+	var <defaultName;
+	var <monitorNodes;
+
+	var <mainGroup;
+	var <mainBus;
+
+	*new { |server, maxEvents=500, batchOverlapRatio=0.8, startLag=0.5, debug=false|
 		^super.new.init(server, maxEvents, batchOverlapRatio, startLag, debug)
 	}
 
@@ -32,25 +39,179 @@ EventScheduler {
 		nextEventIndex = 0;
 
 		nodeWatcher = NodeWatcher.new(server);
+		monitorNodes = IdentityDictionary.new;
 
-		this.registerGroup("default", server.defaultGroup);
+		defaultName = \default;
+
+		this.ensureMonitorDef;
+	}
+
+	initGroupsFromMeta { |meta|
+		var names = ((meta ? Dictionary.new)["groups"] ? #[]).collect(_.asSymbol);
+		groupMap = IdentityDictionary.new;
+
+		names.do { |nm|
+			var gParent = Group.tail(server.defaultGroup);
+			var gSrc = Group.head(gParent);
+			var gFx = Group.after(gSrc);
+			var bSrc = Bus.audio(server, 2);
+			var bFx = Bus.audio(server, 2);
+
+			groupMap[nm] = (
+				group: gParent,
+				srcGroup: gSrc,
+				fxGroup: gFx,
+				srcBus: bSrc,
+				fxBus: bFx,
+				fxNodes: IdentityDictionary.new
+			);
+
+			nodes.put(nm, gParent);
+			buses.put(nm, bFx);
+
+			server.bind {
+				var bypass = Synth.head(gFx, \__busToBus, [
+					\inBus, bSrc.index,
+					\outBus, bFx.index,
+					\gain, 1.0
+				]);
+				groupMap[nm][\fxNodes].put(\__bypass, bypass);
+			};
+		};
+
+		{
+			var gParent = Group.tail(server.defaultGroup);
+			var gSrc = Group.head(gParent);
+			var gFx = Group.after(gSrc);
+			var bSrc = Bus.audio(server, 2);
+			var bFx = Bus.audio(server, 2);
+
+			groupMap[defaultName] = (
+				group: gParent,
+				srcGroup: gSrc,
+				fxGroup: gFx,
+				srcBus: bSrc,
+				fxBus: bFx,
+				fxNodes: IdentityDictionary.new
+			);
+
+			nodes.put(defaultName, gParent);
+			buses.put(defaultName, bFx);
+
+			server.bind {
+				var bypass = Synth.head(gFx, \__busToBus, [
+					\inBus, bSrc.index,
+					\outBus, bFx.index,
+					\gain, 1.0
+				]);
+				groupMap[defaultName][\fxNodes].put(\__bypass, bypass);
+			};
+		}.value;
+
+		// Create main AFTER tracks so it runs last
+		mainGroup = Group.tail(server.defaultGroup);
+		mainBus = Bus.audio(server, 2);
+
+		server.bind {
+			Synth.tail(mainGroup, \__busToMain, [\inBus, mainBus.index, \outBus, 0, \gain, 1.0]);
+		};
+
+		// Now wire each track's fx -> main
+		groupMap.keysValuesDo { |nm, entry|
+			var gFx = entry[\fxGroup];
+			var bFx = entry[\fxBus];
+			server.bind {
+				Synth.tail(gFx, \__busToBus, [\inBus, bFx.index, \outBus, mainBus.index, \gain, 1.0]);
+			};
+		};
+	}
+
+
+	buildInsertsFromMeta { |meta|
+		var ins = (meta ? Dictionary.new)["inserts"];
+		var normalized;
+		if(ins.isNil) { ^this };
+
+		normalized = if(ins.isArray) { ins } { [ins] };
+
+		normalized.do { |item|
+			item.keysValuesDo { |trk, spec|
+				var t, entry, gFx, bSrc, bFx, chain, labels, defs, bypass;
+				t = trk.asSymbol;
+				entry = groupMap[t];
+				gFx = entry[\fxGroup];
+				bSrc = entry[\srcBus];
+				bFx = entry[\fxBus];
+				chain = if(spec.isKindOf(Dictionary)) { spec } { spec.as(Dictionary) };
+				labels = chain.keys;
+				defs = labels.collect { |k| chain[k] };
+				defs = defs.collect { |v| v.isArray.if({ v }, { [v] }) }.flat;
+
+				bypass = entry[\fxNodes].removeAt(\__bypass);
+				if(bypass.notNil) { bypass.free };
+
+				if(defs.isEmpty) {
+					server.bind {
+						var newBypass;
+						newBypass = Synth.head(gFx, \__busToBus, [
+							\inBus, bSrc.index,
+							\outBus, bFx.index,
+							\gain, 1.0
+						]);
+						entry[\fxNodes].put(\__bypass, newBypass);
+					};
+					^this;
+				};
+
+				{
+					var stageBuses = Array.newClear(defs.size - 1).collect { Bus.audio(server, 2) };
+					var prevBus = bSrc;
+					var nextBus;
+
+					defs.do { |defName, i|
+						nextBus = if(i < defs.size - 1) { stageBuses[i] } { bFx };
+						server.bind {
+							var fx;
+							fx = Synth.tail(gFx, defName.asSymbol, [
+								\inbus, prevBus.index,
+								\outbus, nextBus.index
+							]);
+							nodes.put(labels.wrapAt(i), fx);
+							entry[\fxNodes].put(labels.wrapAt(i), fx);
+						};
+						prevBus = nextBus;
+					};
+				}.value;
+			};
+		};
+	}
+
+	ensureMonitorDef {
+		Routine({
+			if(SynthDescLib.global.at(\__busToMain).isNil) {
+				SynthDef(\__busToMain, { |inBus=0, outBus=0, gain=1.0|
+					var sig = In.ar(inBus, 2);
+					Out.ar(outBus, sig * gain);
+				}).add;
+			};
+			if(SynthDescLib.global.at(\__busToBus).isNil) {
+				SynthDef(\__busToBus, { |inBus=0, outBus=0, gain=1.0|
+					var sig = In.ar(inBus, 2);
+					Out.ar(outBus, sig * gain);
+				}).add;
+			};
+			if(SynthDescLib.global.at(\__kl_diskout).isNil) {
+				SynthDef(\__kl_diskout, { |bufnum=0, inbus=0|
+					var sig = In.ar(inbus, 2);
+					DiskOut.ar(bufnum, sig);
+				}).add;
+			};
+			server.sync;
+		}).play;
 	}
 
 	log { |message|
 		if(debug) { message.postln };
-	}
-
-	registerBus { |name, bus, synth|
-		buses.put(name, bus);
-		if(synth.notNil) {
-			nodes.put(name, synth);
-		};
-		^bus;
-	}
-
-	registerGroup { |name, group|
-		nodes.put(name, group);
-		^group;
 	}
 
 	loadFile { |path|
@@ -76,51 +237,56 @@ EventScheduler {
 			};
 		};
 
-		if(jsonData.isNil || jsonData.isKindOf(Array).not) {
-			"ERROR: Invalid JSON data format".postln;
+		if(jsonData["events"].isNil || jsonData["events"].isKindOf(Array).not) {
+			"ERROR: No 'events' key found or 'events' is not an array".postln;
 			^false;
 		};
 
-		events = jsonData;
+		events = jsonData["events"];
 		nextEventIndex = 0;
+
+		this.initGroupsFromMeta(jsonData["meta"]);
+		this.buildInsertsFromMeta(jsonData["meta"]);
 
 		^true;
 	}
 
-	processPfields { |pfields|
+	processPfields { |pfields, groupName|
 		var processedArgs = List.new;
+		var entry = groupMap[(groupName ? defaultName).asSymbol] ? { groupMap[defaultName] };
+		var targetBusIndex = entry[\srcBus].index;
+		var sawOut = false;
 
 		pfields.keysValuesDo { |key, value|
-			var processedKey = key.asSymbol;
-			var processedValue;
+			var k = key.asSymbol;
+			var v = value;
+			var isOutKey = (k == \out) or: { k == \outbus } or: { k == \outBus };
 
-			case
-			{ value.isString } {
-				if(buses.includesKey(value)) {
-					processedValue = buses.at(value);
-				} {
-					if(value.every { |c| "0123456789.-".includes(c) }) {
-						processedValue = value.asFloat;
+			if(isOutKey) {
+				sawOut = true;
+				v = targetBusIndex;
+			} {
+				if(value.isString) {
+					if(buses.includesKey(value)) {
+						v = (buses.at(value)).index;
 					} {
-						processedValue = value;
+						if(value.every { |c| "0123456789.-".includes(c) }) { v = value.asFloat };
 					};
+				} {
+					if(value.isNil) { v = 0 };
 				};
-			}
-			{ value.isNumber } {
-				processedValue = value;
-			}
-			{ value.isNil } {
-				processedValue = 0;
-			}
-			{
-				processedValue = value;
 			};
 
-			processedArgs.add(processedKey);
-			processedArgs.add(processedValue);
+			processedArgs.add(k);
+			processedArgs.add(v);
 		};
 
-		^processedArgs.asArray;
+		if(sawOut.not) {
+			processedArgs.add(\out);
+			processedArgs.add(targetBusIndex);
+		};
+
+		^processedArgs.asArray
 	}
 
 	scheduleBatch { |startIdx|
@@ -153,10 +319,8 @@ EventScheduler {
 				this.scheduleEvent(currentEvent);
 				scheduledCount = scheduledCount + 1;
 				lastScheduledTime = eventTime;
-				// this.log("  Scheduled: idx=%, time=%s, rel=%s".format(endIdx, eventTime, relativeTime));
 			} {
 				skippedCount = skippedCount + 1;
-				// this.log("  SKIPPED: idx=%, time=%s, rel=%s (in past)".format(endIdx, eventTime, relativeTime));
 			};
 
 			endIdx = endIdx + 1;
@@ -191,36 +355,32 @@ EventScheduler {
 			};
 		} {
 			this.log("All events processed.");
-			// this.stop;
 		};
 
 		nextEventIndex = endIdx;
 	}
 
 	scheduleEvent { |event|
-		var type, id, eventTime, pfields;
+		var type, id, eventTime, pfields, groupKey;
+		groupKey = (event["group"] ? defaultName).asSymbol;
 
 		type = event["type"];
 		id = event["id"];
 		eventTime = event["start"].asFloat;
 		pfields = event["pfields"] ?? { Dictionary.new };
 
-		// this.log("Event: % id:% at % sec".format(type, id, eventTime));
-
 		case
 		{ type == "new" } {
 			var synthName = event["synthName"];
-			var groupName = event["group"] ?? "default";
-			this.createSynth(id, synthName, eventTime, pfields, groupName);
+			this.createSynth(id, synthName, eventTime, pfields, groupKey);
 		}
 		{ type == "set" } {
-			this.setNode(id, eventTime, pfields);
+			this.setNode(id, eventTime, pfields, groupKey);
 		}
 		{ type == "release" }{
 			this.releaseNode(id, eventTime);
 		}
 		{ type == "message" } {
-			// TODO
 		}
 		{
 			this.log("WARNING: Unknown event type: %".format(type));
@@ -229,45 +389,33 @@ EventScheduler {
 
 	createSynth { |synthId, synthName, eventTime, pfields, groupName|
 		var absTime = startTime + eventTime;
-		var args = this.processPfields(pfields);
-		var group = nodes.at(groupName);
-
-		// this.log("Creating synth % (synthName: %) in group %".format(synthId, synthName, groupName));
+		var args = this.processPfields(pfields, groupName);
+		var entry = groupMap[(groupName ? defaultName).asSymbol] ? groupMap[defaultName];
+		var targetGroup = entry[\srcGroup];
 
 		SystemClock.schedAbs(absTime, {
 			if(server.serverRunning) {
 				server.bind {
-					var synth = Synth(synthName, args, group);
+					var synth;
+					synth = Synth(synthName, args, targetGroup);
 					nodes.put(synthId, synth);
 					nodeWatcher.register(synth);
-
-					// this.log("Synth % created with server nodeID %".format(synthId, synth.nodeID));
-
-					synth.onFree {
-						// this.log("Synth % freed".format(synthId));
-						nodes.removeAt(synthId);
-					};
+					synth.onFree { nodes.removeAt(synthId) };
 				};
 			};
 			nil;
 		});
 	}
 
-	setNode { |nodeId, eventTime, pfields|
+	setNode { |nodeId, eventTime, pfields, groupName|
 		var absTime = startTime + eventTime;
-		var args = this.processPfields(pfields);
+		var args = this.processPfields(pfields, groupName);
 
 		SystemClock.schedAbs(absTime, {
 			if(server.serverRunning) {
 				server.bind {
 					var node = nodes.at(nodeId);
-
-					if(node.isNil) {
-						// this.log("ERROR: Cannot set node % - node not found at execution time".format(nodeId));
-					} {
-						// this.log("Setting node % with args: %".format(nodeId, args));
-						node.set(*args);
-					};
+					if(node.notNil) { node.set(*args) };
 				};
 			};
 			nil;
@@ -281,13 +429,7 @@ EventScheduler {
 			if(server.serverRunning) {
 				server.bind {
 					var node = nodes.at(nodeId);
-
-					if(node.isNil) {
-						// this.log("ERROR: Cannot set node % - node not found at execution time".format(nodeId));
-					} {
-						// this.log("Relasing node %".format(nodeId));
-						node.release(nil);
-					};
+					if(node.notNil) { node.release(nil) };
 				};
 			};
 			nil;
@@ -351,5 +493,87 @@ EventScheduler {
 		"  Events: %".format(events.size).postln;
 		"  Active nodes: %".format(nodes.size).postln;
 		"  Registered buses: %".format(buses.size).postln;
+	}
+
+	record { |path, stems=true, end_padding=5.0|
+		var pn = PathName(path);
+		var dir = pn.pathOnly;
+		var base = pn.fileNameWithoutExtension;
+		var ext  = pn.extension ? "wav";
+		var pieceDur;
+
+		pieceDur = if(events.size > 0) {
+			events.collect({ |e| e["start"].asFloat }).maxItem
+		} { 0.0 };
+
+		Routine({
+			var tStart, tStop;
+			var recs, bufMap, diskNodes, ch, frames;
+
+			if(stems.not) {
+				server.prepareForRecord(dir +/+ (base ++ "." ++ ext), 2);
+				server.sync;
+
+				this.play;
+
+				tStart = startTime;
+				tStop  = tStart + pieceDur + end_padding;
+
+				SystemClock.schedAbs(tStart, { server.record; nil });
+				SystemClock.schedAbs(tStop,  { server.stopRecording; nil });
+			} {
+				bufMap = IdentityDictionary.new;
+				ch = 2;
+				frames = 131072;
+
+				groupMap.keysValuesDo { |nm, entry|
+					var stemPath = dir +/+ (base ++ "_" ++ nm.asString ++ "." ++ ext);
+					var buf = Buffer.alloc(server, frames, ch);
+					buf.write(
+						path: stemPath,
+						headerFormat: ext.asString,
+						sampleFormat: "int24",
+						numFrames: 0,
+						startFrame: 0,
+						leaveOpen: true
+					);
+					bufMap[nm] = buf;
+				};
+				server.sync;
+
+				this.play;
+
+				tStart = startTime;
+				tStop  = tStart + pieceDur + end_padding;
+
+				diskNodes = IdentityDictionary.new;
+				SystemClock.schedAbs(tStart, {
+					server.bind {
+						groupMap.keysValuesDo { |nm, entry|
+							var buf, inbus, node;
+							buf = bufMap[nm];
+							inbus = entry[\fxBus].index;
+							node = Synth.tail(entry[\fxGroup], \__kl_diskout, [
+								\bufnum, buf.bufnum,
+								\inbus,  inbus
+							]);
+							diskNodes[nm] = node;
+						};
+					};
+					nil
+				});
+
+				SystemClock.schedAbs(tStop, {
+					diskNodes.keysValuesDo { |k, n| n.free };
+					AppClock.sched(0.1, {
+						bufMap.keysValuesDo { |k, b| b.close; b.free };
+						nil
+					});
+					nil
+				});
+			};
+		}).play(AppClock);
+
+		^true
 	}
 }
