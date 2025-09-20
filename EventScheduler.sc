@@ -43,150 +43,152 @@ EventScheduler {
 
 		defaultName = \default;
 
-		this.ensureMonitorDef;
+		this.loadSynthDefs;
 	}
 
-	initGroupsFromMeta { |meta|
+	initGroupsAndInserts { |meta|
 		var names = ((meta ? Dictionary.new)["groups"] ? #[]).collect(_.asSymbol);
+		var inserts = (meta ? Dictionary.new)["inserts"];
+		var insertMap = IdentityDictionary.new;
+
 		groupMap = IdentityDictionary.new;
 
-		names.do { |nm|
-			var gParent = Group.tail(server.defaultGroup);
-			var gSrc = Group.head(gParent);
-			var gFx = Group.after(gSrc);
-			var bSrc = Bus.audio(server, 2);
-			var bFx = Bus.audio(server, 2);
+		if(inserts.notNil) {
+			inserts.keysValuesDo { |trackName, spec|
+				var effects = List.new;
+				var specs = if(spec.isKindOf(Array)) { spec } { [spec] };
 
-			groupMap[nm] = (
-				group: gParent,
-				srcGroup: gSrc,
-				fxGroup: gFx,
-				srcBus: bSrc,
-				fxBus: bFx,
-				fxNodes: IdentityDictionary.new
-			);
-
-			nodes.put(nm, gParent);
-			buses.put(nm, bFx);
-
-			server.bind {
-				var bypass = Synth.head(gFx, \__busToBus, [
-					\inBus, bSrc.index,
-					\outBus, bFx.index,
-					\gain, 1.0
-				]);
-				groupMap[nm][\fxNodes].put(\__bypass, bypass);
-			};
-		};
-
-		{
-			var gParent = Group.tail(server.defaultGroup);
-			var gSrc = Group.head(gParent);
-			var gFx = Group.after(gSrc);
-			var bSrc = Bus.audio(server, 2);
-			var bFx = Bus.audio(server, 2);
-
-			groupMap[defaultName] = (
-				group: gParent,
-				srcGroup: gSrc,
-				fxGroup: gFx,
-				srcBus: bSrc,
-				fxBus: bFx,
-				fxNodes: IdentityDictionary.new
-			);
-
-			nodes.put(defaultName, gParent);
-			buses.put(defaultName, bFx);
-
-			server.bind {
-				var bypass = Synth.head(gFx, \__busToBus, [
-					\inBus, bSrc.index,
-					\outBus, bFx.index,
-					\gain, 1.0
-				]);
-				groupMap[defaultName][\fxNodes].put(\__bypass, bypass);
-			};
-		}.value;
-
-		// Create main AFTER tracks so it runs last
-		mainGroup = Group.tail(server.defaultGroup);
-		mainBus = Bus.audio(server, 2);
-
-		server.bind {
-			Synth.tail(mainGroup, \__busToMain, [\inBus, mainBus.index, \outBus, 0, \gain, 1.0]);
-		};
-
-		// Now wire each track's fx -> main
-		groupMap.keysValuesDo { |nm, entry|
-			var gFx = entry[\fxGroup];
-			var bFx = entry[\fxBus];
-			server.bind {
-				Synth.tail(gFx, \__busToBus, [\inBus, bFx.index, \outBus, mainBus.index, \gain, 1.0]);
-			};
-		};
-	}
-
-
-	buildInsertsFromMeta { |meta|
-		var ins = (meta ? Dictionary.new)["inserts"];
-		var normalized;
-		if(ins.isNil) { ^this };
-
-		normalized = if(ins.isArray) { ins } { [ins] };
-
-		normalized.do { |item|
-			item.keysValuesDo { |trk, spec|
-				var t, entry, gFx, bSrc, bFx, chain, labels, defs, bypass;
-				t = trk.asSymbol;
-				entry = groupMap[t];
-				gFx = entry[\fxGroup];
-				bSrc = entry[\srcBus];
-				bFx = entry[\fxBus];
-				chain = if(spec.isKindOf(Dictionary)) { spec } { spec.as(Dictionary) };
-				labels = chain.keys;
-				defs = labels.collect { |k| chain[k] };
-				defs = defs.collect { |v| v.isArray.if({ v }, { [v] }) }.flat;
-
-				bypass = entry[\fxNodes].removeAt(\__bypass);
-				if(bypass.notNil) { bypass.free };
-
-				if(defs.isEmpty) {
-					server.bind {
-						var newBypass;
-						newBypass = Synth.head(gFx, \__busToBus, [
-							\inBus, bSrc.index,
-							\outBus, bFx.index,
-							\gain, 1.0
-						]);
-						entry[\fxNodes].put(\__bypass, newBypass);
-					};
-					^this;
+				specs.do { |item|
+					var uid = item["uid"].asSymbol;
+					var synthName = item["synthName"].asSymbol;
+					var args = item["args"];
+					effects.add((
+						uid: uid,
+						synthName: synthName,
+						args: args
+					));
 				};
 
-				{
-					var stageBuses = Array.newClear(defs.size - 1).collect { Bus.audio(server, 2) };
-					var prevBus = bSrc;
-					var nextBus;
+				insertMap[trackName.asSymbol] = effects;
+			};
+		};
 
-					defs.do { |defName, i|
-						nextBus = if(i < defs.size - 1) { stageBuses[i] } { bFx };
-						server.bind {
-							var fx;
-							fx = Synth.tail(gFx, defName.asSymbol, [
-								\inbus, prevBus.index,
-								\outbus, nextBus.index
-							]);
-							nodes.put(labels.wrapAt(i), fx);
-							entry[\fxNodes].put(labels.wrapAt(i), fx);
-						};
-						prevBus = nextBus;
-					};
-				}.value;
+		names.do { |nm|
+			this.createGroupWithInserts(nm, insertMap[nm]);
+		};
+
+		this.createGroupWithInserts(\main, insertMap[\main]);
+
+		mainBus = groupMap[\main][\fxBus];
+		mainGroup = groupMap[\main][\group];
+
+		server.bind {
+			Synth.tail(groupMap[\main][\fxGroup], \__busToMain, [\inBus, mainBus.index, \outBus, 0, \gain, 1.0]);
+		};
+
+		groupMap.keysValuesDo { |nm, entry|
+			if(nm != \main) {
+				var gFx = entry[\fxGroup];
+				var bFx = entry[\fxBus];
+				var mainSrcBus = groupMap[\main][\srcBus];
+				server.bind {
+					Synth.tail(gFx, \__busToBus, [\inBus, bFx.index, \outBus, mainSrcBus.index, \gain, 1.0]);
+				};
 			};
 		};
 	}
 
-	ensureMonitorDef {
+	createGroupWithInserts { |groupName, effectsList|
+		var gParent = Group.tail(server.defaultGroup);
+		var gSrc = Group.head(gParent);
+		var gFx = Group.after(gSrc);
+		var bSrc = Bus.audio(server, 2);
+		var bFx = Bus.audio(server, 2);
+
+		groupMap[groupName] = (
+			group: gParent,
+			srcGroup: gSrc,
+			fxGroup: gFx,
+			srcBus: bSrc,
+			fxBus: bFx,
+			fxNodes: IdentityDictionary.new
+		);
+
+		nodes.put(groupName, gParent);
+		buses.put(groupName, bFx);
+
+		if(effectsList.isNil or: { effectsList.isEmpty }) {
+			server.bind {
+				var bypass = Synth.head(gFx, \__busToBus, [
+					\inBus, bSrc.index,
+					\outBus, bFx.index,
+					\gain, 1.0
+				]);
+				groupMap[groupName][\fxNodes].put(\__bypass, bypass);
+			};
+		} {
+			var stageBuses = Array.newClear(effectsList.size - 1).collect { Bus.audio(server, 2) };
+			var prevBus = bSrc;
+			var nextBus;
+
+			effectsList.do { |effect, i|
+				var uid = effect.uid;
+				var synthName = effect.synthName;
+				var initialArgs = effect.args;
+				var desc = SynthDescLib.global.at(synthName);
+				var inParam, outParam;
+				var argList;
+
+				nextBus = if(i < (effectsList.size - 1)) { stageBuses[i] } { bFx };
+
+				if(desc.notNil) {
+					var controlDict = desc.controlDict;
+					inParam = case
+					{ controlDict.includesKey(\in) } { \in }
+					{ controlDict.includesKey(\inbus) } { \inbus }
+					{ controlDict.includesKey(\inBus) } { \inBus }
+					{ \in };
+					outParam = case
+					{ controlDict.includesKey(\out) } { \out }
+					{ controlDict.includesKey(\outbus) } { \outbus }
+					{ controlDict.includesKey(\outBus) } { \outBus }
+					{ \out };
+				} {
+					inParam = \in;
+					outParam = \out;
+				};
+
+				argList = List.new;
+				argList.add(inParam).add(prevBus.index);
+				argList.add(outParam).add(nextBus.index);
+
+				if(initialArgs.notNil) {
+					initialArgs.keysValuesDo { |key, value|
+						var k = key.asSymbol;
+						var v = value;
+
+						if(value.isString) {
+							if(value.every { |c| "0123456789.-".includes(c) }) {
+								v = value.asFloat
+							};
+						};
+
+						argList.add(k).add(v);
+					};
+				};
+
+				server.bind {
+					var fx = Synth.tail(gFx, synthName, argList.asArray);
+					nodes.put(uid, fx);
+					groupMap[groupName][\fxNodes].put(uid, fx);
+				};
+
+				prevBus = nextBus;
+			};
+		};
+	}
+
+	loadSynthDefs {
 		Routine({
 			if(SynthDescLib.global.at(\__busToMain).isNil) {
 				SynthDef(\__busToMain, { |inBus=0, outBus=0, gain=1.0|
@@ -245,8 +247,7 @@ EventScheduler {
 		events = jsonData["events"];
 		nextEventIndex = 0;
 
-		this.initGroupsFromMeta(jsonData["meta"]);
-		this.buildInsertsFromMeta(jsonData["meta"]);
+		this.initGroupsAndInserts(jsonData["meta"]);
 
 		^true;
 	}
@@ -381,6 +382,7 @@ EventScheduler {
 			this.releaseNode(id, eventTime);
 		}
 		{ type == "message" } {
+			// TODO
 		}
 		{
 			this.log("WARNING: Unknown event type: %".format(type));
