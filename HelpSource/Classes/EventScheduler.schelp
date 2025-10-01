@@ -1,0 +1,194 @@
+CLASS:: EventScheduler
+summary:: Event scheduler with group management and effect chains
+categories:: Scheduling, Live Coding
+related:: Classes/TempoClock, Classes/SystemClock, Classes/Synth
+
+DESCRIPTION::
+EventScheduler is a comprehensive event scheduling system for SuperCollider that supports:
+- Loading events from JSON/YAML files
+- Automatic group and bus management
+- Effect chain insertion per group
+- Batch event scheduling with overlap
+- Multi-track recording (stems)
+- Real-time event scheduling
+
+CLASSMETHODS::
+
+METHOD:: new
+Create a new EventScheduler instance.
+
+ARGUMENT:: server
+The server to use. Defaults to Server.default.
+
+ARGUMENT:: maxEvents
+Maximum events per batch. Default is 500.
+
+ARGUMENT:: batchOverlapRatio
+Overlap ratio between batches (0.0-1.0). Default is 0.8.
+
+ARGUMENT:: startLag
+Lag time before starting playback. Default is 0.5 seconds.
+
+ARGUMENT:: debug
+Enable debug logging. Default is false.
+
+returns:: A new EventScheduler instance.
+
+INSTANCEMETHODS::
+
+METHOD:: loadFile
+Load events from a JSON or YAML file.
+
+ARGUMENT:: path
+Path to the file containing event data.
+
+returns:: Boolean indicating success.
+
+The file should have this structure:
+code::
+{
+  "meta": {
+    "groups": ["drums", "bass", "lead"],
+    "inserts": {
+      "drums": [
+        {"uid": "compressor", "synthName": "Compressor", "args": {"ratio": 4}}
+      ],
+      "main": [
+        {"uid": "reverb", "synthName": "FreeVerb", "args": {"mix": 0.3}}
+      ]
+    }
+  },
+  "events": [
+    {
+      "type": "new",
+      "id": "leadSynth",
+      "start": 0.0,
+      "synthName": "varSaw",
+      "group": "lead",
+      "pfields": {"freq": 440, "amp": 0.8}
+    },
+    {
+      "type": "set",
+      "id": "leadSynth",
+      "start": 0.5,
+      "pfields": {"freq": 462}
+    },
+    {
+      "type": "release",
+      "id": "leadSynth",
+      "start": 1.0
+    }
+  ]
+}
+::
+
+METHOD:: play
+Start event playback.
+
+returns:: Boolean indicating success.
+
+METHOD:: stop
+Stop playback and free all nodes.
+
+returns:: Boolean indicating success.
+
+METHOD:: record
+Record the performance to audio file(s).
+
+ARGUMENT:: path
+Output file path. For stems, this becomes the base name.
+
+ARGUMENT:: stems
+Whether to record individual group stems. Default is true.
+
+ARGUMENT:: end_padding
+Extra time to record after the last event. Default is 5.0 seconds.
+
+returns:: Boolean indicating success.
+
+METHOD:: status
+Print current status information.
+
+METHOD:: hasNode
+Check if a node ID is currently active.
+
+ARGUMENT:: nodeId
+The node ID to check.
+
+returns:: Boolean.
+
+METHOD:: debug
+Get/set debug mode.
+
+ARGUMENT:: value
+Boolean to enable/disable debug logging.
+
+SUBSECTION:: Event Types
+
+The scheduler supports these event types:
+
+DEFINITIONLIST::
+## "new"
+|| Create a new synth with the specified synthName and pfields
+## "set"
+|| Set parameters on an existing node
+## "release"
+|| Release an existing node
+## "message"
+|| Print a message (for debugging)
+::
+
+SUBSECTION:: Groups and Effects
+
+Groups are automatically created based on the "groups" array in the meta section. Each group has:
+- A source group for synths
+- An effects group for processing
+- Source and effects buses
+- Automatic routing between groups
+
+Effects are specified in the "inserts" section and are automatically instantiated with proper bus routing.
+
+EXAMPLES::
+
+code::
+// Basic usage
+e = EventScheduler.new(debug: true);
+e.loadFile("path/to/events.json");
+e.play;
+
+// Record with stems
+e.record("output/mypiece.wav", stems: true);
+
+// Stop playback
+e.stop;
+
+// Check status
+e.status;
+::
+
+code::
+// Minimal event file structure
+{
+  "meta": {
+    "groups": ["lead"]
+  },
+  "events": [
+    {
+      "type": "new",
+      "id": "note1",
+      "start": 0.0,
+      "synthName": "default",
+      "group": "lead",
+      "pfields": {"freq": 440, "amp": 0.5}
+    }
+  ]
+}
+::
+
+SECTION:: Implementation Notes
+
+- Events are scheduled in batches to handle large sequences efficiently
+- The batchOverlapRatio controls when the next batch begins relative to the current batch duration
+- All buses are stereo (2 channels)
+- Groups automatically route to the main output
+- Node management includes automatic cleanup on synth release

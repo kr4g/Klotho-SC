@@ -16,21 +16,31 @@ EventScheduler {
 
 	var <groupMap;     // \name -> (group, srcGroup, fxGroup, srcBus, fxBus, fxNodes)
 	var <defaultName;
-	var <monitorNodes;
 
 	var <mainGroup;
 	var <mainBus;
 
-	*new { |server, maxEvents=500, batchOverlapRatio=0.8, startLag=0.5, debug=false|
-		^super.new.init(server, maxEvents, batchOverlapRatio, startLag, debug)
+	var <groupOrder;
+	var <busSynths;
+
+	var <loadedFilePath;
+
+	var <enableMonitoring;
+
+	var <isReady;
+
+	*new { |server, maxEvents=500, batchOverlapRatio=0.8, startLag=0.5, debug=false, enableMonitoring=false|
+		^super.new.init(server, maxEvents, batchOverlapRatio, startLag, debug, enableMonitoring)
 	}
 
-	init { |serverArg, maxEventsArg, overlapRatioArg, lag, debugFlag|
+	init { |serverArg, maxEventsArg, overlapRatioArg, lag, debugFlag, monitorFlag|
 		server = serverArg;
 		maxEvents = maxEventsArg;
 		batchOverlapRatio = overlapRatioArg;
 		startLag = lag;
 		debug = debugFlag;
+		enableMonitoring = monitorFlag;
+		isReady = false;
 
 		events = Array.new;
 		nodes = Dictionary.new;
@@ -39,9 +49,13 @@ EventScheduler {
 		nextEventIndex = 0;
 
 		nodeWatcher = NodeWatcher.new(server);
-		monitorNodes = IdentityDictionary.new;
+
+		groupOrder = Array.new;
+		busSynths = IdentityDictionary.new;
 
 		defaultName = \default;
+
+		CmdPeriod.add({ isPlaying = false; nextEventIndex = 0 });
 
 		this.loadSynthDefs;
 	}
@@ -51,7 +65,9 @@ EventScheduler {
 		var inserts = (meta ? Dictionary.new)["inserts"];
 		var insertMap = IdentityDictionary.new;
 
+		groupOrder = names.copy;
 		groupMap = IdentityDictionary.new;
+		busSynths.clear;
 
 		if(inserts.notNil) {
 			inserts.keysValuesDo { |trackName, spec|
@@ -83,16 +99,33 @@ EventScheduler {
 		mainGroup = groupMap[\main][\group];
 
 		server.bind {
-			Synth.tail(groupMap[\main][\fxGroup], \__busToMain, [\inBus, mainBus.index, \outBus, 0, \gain, 1.0]);
+			var synthName = if(enableMonitoring) { \__busRouterMonitor } { \__busRouter };
+			var args = if(enableMonitoring) {
+				[\inBus, mainBus.index, \outBus, 0, \gain, 1.0, \id, groupOrder.size]
+			} {
+				[\inBus, mainBus.index, \outBus, 0, \gain, 1.0]
+			};
+			var mainBusSynth = Synth.tail(groupMap[\main][\group], synthName, args);
+			busSynths[\main] = mainBusSynth;
+			nodes.put(\__main_bus_synth, mainBusSynth);
 		};
 
 		groupMap.keysValuesDo { |nm, entry|
 			if(nm != \main) {
-				var gFx = entry[\fxGroup];
+				var gParent = entry[\group];
 				var bFx = entry[\fxBus];
 				var mainSrcBus = groupMap[\main][\srcBus];
+				var idx = groupOrder.indexOf(nm);
 				server.bind {
-					Synth.tail(gFx, \__busToBus, [\inBus, bFx.index, \outBus, mainSrcBus.index, \gain, 1.0]);
+					var synthName = if(enableMonitoring) { \__busRouterMonitor } { \__busRouter };
+					var args = if(enableMonitoring) {
+						[\inBus, bFx.index, \outBus, mainSrcBus.index, \gain, 1.0, \id, idx]
+					} {
+						[\inBus, bFx.index, \outBus, mainSrcBus.index, \gain, 1.0]
+					};
+					var groupBusSynth = Synth.tail(gParent, synthName, args);
+					busSynths[nm] = groupBusSynth;
+					nodes.put(("__" ++ nm.asString ++ "_bus_synth").asSymbol, groupBusSynth);
 				};
 			};
 		};
@@ -119,7 +152,7 @@ EventScheduler {
 
 		if(effectsList.isNil or: { effectsList.isEmpty }) {
 			server.bind {
-				var bypass = Synth.head(gFx, \__busToBus, [
+				var bypass = Synth.head(gFx, \__busRouter, [
 					\inBus, bSrc.index,
 					\outBus, bFx.index,
 					\gain, 1.0
@@ -190,16 +223,24 @@ EventScheduler {
 
 	loadSynthDefs {
 		Routine({
-			if(SynthDescLib.global.at(\__busToMain).isNil) {
-				SynthDef(\__busToMain, { |inBus=0, outBus=0, gain=1.0|
+			if(SynthDescLib.global.at(\__busRouter).isNil) {
+				SynthDef(\__busRouter, { |inBus=0, outBus=0, gain=1.0|
 					var sig = In.ar(inBus, 2);
-					Out.ar(outBus, sig * gain);
+					sig = sig * gain;
+					ReplaceOut.ar(inBus, sig);
+					Out.ar(outBus, sig);
 				}).add;
 			};
-			if(SynthDescLib.global.at(\__busToBus).isNil) {
-				SynthDef(\__busToBus, { |inBus=0, outBus=0, gain=1.0|
+			if(SynthDescLib.global.at(\__busRouterMonitor).isNil) {
+				SynthDef(\__busRouterMonitor, { |inBus=0, outBus=0, gain=1.0, id=0|
+					var amp, peak;
 					var sig = In.ar(inBus, 2);
-					Out.ar(outBus, sig * gain);
+					sig = sig * gain;
+					amp = Amplitude.kr(sig, 0.01, 0.1);
+					peak = amp.sum * 0.5;
+					SendReply.kr(Impulse.kr(20), '/trackLevel', [peak, id]);
+					ReplaceOut.ar(inBus, sig);
+					Out.ar(outBus, sig);
 				}).add;
 			};
 			if(SynthDescLib.global.at(\__kl_diskout).isNil) {
@@ -209,6 +250,7 @@ EventScheduler {
 				}).add;
 			};
 			server.sync;
+			isReady = true;
 		}).play;
 	}
 
@@ -216,38 +258,56 @@ EventScheduler {
 		if(debug) { message.postln };
 	}
 
+	getBusSynth { |groupName|
+		^busSynths[groupName.asSymbol];
+	}
+
+	getAllBusSynths {
+		^busSynths;
+	}
+
 	loadFile { |path|
-		var file, jsonString, jsonData;
+		Routine({
+			var file, jsonString, jsonData;
 
-		file = File(path, "r");
-		if(file.isOpen.not) {
-			"ERROR: Could not open file %".format(path).postln;
-			^false;
-		};
+			while({ isReady.not }) { 0.01.wait };
 
-		jsonString = file.readAllString;
-		file.close;
+			server.freeAll;
+			server.newBusAllocators;
+			server.sync;
 
-		try {
-			jsonData = jsonString.parseJSON;
-		} { |error|
-			try {
-				jsonData = jsonString.parseYAML;
-			} { |yamlError|
-				"ERROR: Could not parse JSON data".postln;
+			loadedFilePath = path;
+
+			file = File(path, "r");
+			if(file.isOpen.not) {
+				"ERROR: Could not open file %".format(path).postln;
 				^false;
 			};
-		};
 
-		if(jsonData["events"].isNil || jsonData["events"].isKindOf(Array).not) {
-			"ERROR: No 'events' key found or 'events' is not an array".postln;
-			^false;
-		};
+			jsonString = file.readAllString;
+			file.close;
 
-		events = jsonData["events"];
-		nextEventIndex = 0;
+			try {
+				jsonData = jsonString.parseJSON;
+			} { |error|
+				try {
+					jsonData = jsonString.parseYAML;
+				} { |yamlError|
+					"ERROR: Could not parse JSON data".postln;
+					^false;
+				};
+			};
 
-		this.initGroupsAndInserts(jsonData["meta"]);
+			if(jsonData["events"].isNil || jsonData["events"].isKindOf(Array).not) {
+				"ERROR: No 'events' key found or 'events' is not an array".postln;
+				^false;
+			};
+
+			events = jsonData["events"];
+			nextEventIndex = 0;
+
+			this.initGroupsAndInserts(jsonData["meta"]);
+		}).play;
 
 		^true;
 	}
@@ -382,7 +442,7 @@ EventScheduler {
 			this.releaseNode(id, eventTime);
 		}
 		{ type == "message" } {
-			// TODO
+			this.message("TODO", eventTime);
 		}
 		{
 			this.log("WARNING: Unknown event type: %".format(type));
@@ -438,6 +498,19 @@ EventScheduler {
 		});
 	}
 
+	message { |msg, eventTime|
+		var absTime = startTime + eventTime;
+
+		SystemClock.schedAbs(absTime, {
+			if(server.serverRunning) {
+				server.bind {
+					msg.postln;
+				};
+			};
+			nil;
+		});
+	}
+
 	play {
 		if(server.serverRunning.not) {
 			"ERROR: Server not running. Boot the server first.".postln;
@@ -471,17 +544,25 @@ EventScheduler {
 			"Not playing.".postln;
 			^false
 		};
-
-		if(nextBatchTask.notNil) {
-			nextBatchTask.stop;
-			nextBatchTask = nil;
-		};
-
-		server.freeAll;
-		nodes.clear;
-
-		isPlaying = false;
 		"Playback stopped".postln;
+		//
+		// if(nextBatchTask.notNil) {
+		// 	nextBatchTask.stop;
+		// 	nextBatchTask = nil;
+		// };
+		//
+		// server.freeAll;
+		// nodes.clear;
+		Routine({
+			CmdPeriod.run;
+			server.sync;
+			isPlaying = false;
+			if(loadedFilePath.notNil) {
+				this.loadFile(loadedFilePath);  // Reload
+				"File reloaded and ready for playback".postln;
+			};
+		}).play;
+
 		^true;
 	}
 
@@ -531,6 +612,8 @@ EventScheduler {
 				groupMap.keysValuesDo { |nm, entry|
 					var stemPath = dir +/+ (base ++ "_" ++ nm.asString ++ "." ++ ext);
 					var buf = Buffer.alloc(server, frames, ch);
+					server.sync;
+
 					buf.write(
 						path: stemPath,
 						headerFormat: ext.asString,
@@ -539,9 +622,10 @@ EventScheduler {
 						startFrame: 0,
 						leaveOpen: true
 					);
+					server.sync;
+
 					bufMap[nm] = buf;
 				};
-				server.sync;
 
 				this.play;
 
@@ -552,10 +636,11 @@ EventScheduler {
 				SystemClock.schedAbs(tStart, {
 					server.bind {
 						groupMap.keysValuesDo { |nm, entry|
-							var buf, inbus, node;
+							var buf, inbus, node, busRouter;
 							buf = bufMap[nm];
 							inbus = entry[\fxBus].index;
-							node = Synth.tail(entry[\fxGroup], \__kl_diskout, [
+							busRouter = busSynths[nm];
+							node = Synth.after(busRouter, \__kl_diskout, [
 								\bufnum, buf.bufnum,
 								\inbus,  inbus
 							]);
@@ -569,6 +654,7 @@ EventScheduler {
 					diskNodes.keysValuesDo { |k, n| n.free };
 					AppClock.sched(0.1, {
 						bufMap.keysValuesDo { |k, b| b.close; b.free };
+						isPlaying = false;
 						nil
 					});
 					nil
