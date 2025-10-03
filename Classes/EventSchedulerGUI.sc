@@ -206,7 +206,8 @@ EventSchedulerGUI {
 				}),
 
 				StaticText()
-				.string_("0\n\n-20\n\n-40\n\n-60\n\n-∞")
+				// .string_("0\n\n-20\n\n-40\n\n-60\n\n-∞")
+				.string_("+6\n\n0\n\n-20\n\n-40\n\n-60")
 				.align_(\left)
 				.font_(Font.default.size_(9))
 				.fixedWidth_(25)
@@ -396,6 +397,14 @@ EventSchedulerGUI {
 
 			recordButton.value = 1;
 
+			scheduler.recordingCompleteCallback = {
+				defer {
+					playButton.value = 0;
+					recordButton.value = 0;
+					"Recording complete".postln;
+				};
+			};
+
 			if(scheduler.isPlaying.not) {
 				playButton.value = 1;
 				scheduler.record(outputPath, stems);
@@ -404,6 +413,13 @@ EventSchedulerGUI {
 				this.stop;
 				Routine({
 					0.5.wait;
+					scheduler.recordingCompleteCallback = {
+						defer {
+							playButton.value = 0;
+							recordButton.value = 0;
+							"Recording complete".postln;
+						};
+					};
 					scheduler.record(outputPath, stems);
 				}).play;
 			};
@@ -437,13 +453,17 @@ EventSchedulerGUI {
 	}
 
 	sliderToDb { |value|
+		var amp;
 		if(value <= 0) { ^(-inf) };
-		^(value.squared.ampdb);
+		amp = value.squared * 6.dbamp;
+		^amp.ampdb;
 	}
 
 	ampToSlider { |amp|
+		var normalized;
 		if(amp <= 0) { ^0 };
-		^(amp.ampdb.dbamp.sqrt);
+		normalized = (amp / 6.dbamp).clip(0, 1);
+		^normalized.sqrt;
 	}
 
 	resetMeters {

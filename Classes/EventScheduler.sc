@@ -29,6 +29,8 @@ EventScheduler {
 
 	var <isReady;
 
+	var <>recordingCompleteCallback;
+
 	*new { |server, maxEvents=500, batchOverlapRatio=0.8, startLag=0.5, debug=false, enableMonitoring=false|
 		^super.new.init(server, maxEvents, batchOverlapRatio, startLag, debug, enableMonitoring)
 	}
@@ -603,7 +605,15 @@ EventScheduler {
 				tStop  = tStart + pieceDur + end_padding;
 
 				SystemClock.schedAbs(tStart, { server.record; nil });
-				SystemClock.schedAbs(tStop,  { server.stopRecording; nil });
+				// SystemClock.schedAbs(tStop,  { server.stopRecording; this.stop; nil });
+				SystemClock.schedAbs(tStop,  {
+					server.stopRecording;
+					this.stop;
+					if(recordingCompleteCallback.notNil) {
+						AppClock.sched(0, { recordingCompleteCallback.value; nil });
+					};
+					nil
+				});
 			} {
 				bufMap = IdentityDictionary.new;
 				ch = 2;
@@ -652,9 +662,18 @@ EventScheduler {
 
 				SystemClock.schedAbs(tStop, {
 					diskNodes.keysValuesDo { |k, n| n.free };
+					// AppClock.sched(0.1, {
+					// 	bufMap.keysValuesDo { |k, b| b.close; b.free };
+					// 	// isPlaying = false;
+					// 	this.stop;
+					// 	nil
+					// });
 					AppClock.sched(0.1, {
 						bufMap.keysValuesDo { |k, b| b.close; b.free };
-						isPlaying = false;
+						this.stop;
+						if(recordingCompleteCallback.notNil) {
+							recordingCompleteCallback.value;
+						};
 						nil
 					});
 					nil
