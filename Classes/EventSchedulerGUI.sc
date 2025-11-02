@@ -10,15 +10,26 @@ EventSchedulerGUI {
 	var <currentFilePath;
 	var <server;
 
+	var <dbHead;
+
 	*new { |server|
 		^super.new.init(server)
 	}
 
-	init { |serverArg|
+	init { |serverArg, maxEvents=500, batchOverlapRatio=0.8, startLag=0.5, debug=false|
 		server = serverArg ? Server.default;
-		scheduler = EventScheduler.new(server, enableMonitoring: true);
+		scheduler = EventScheduler.new(
+			server: server,
+			maxEvents: maxEvents,
+			batchOverlapRatio: batchOverlapRatio,
+			startLag: startLag,
+			enableMonitoring: true,
+		);
 		trackViews = List.new;
 		groupOrder = List.new;
+
+		dbHead = 6;
+
 		this.createWindow;
 		this.createFileMenu;
 		this.createTransportControls;
@@ -207,7 +218,7 @@ EventSchedulerGUI {
 
 				StaticText()
 				// .string_("0\n\n-20\n\n-40\n\n-60\n\n-∞")
-				.string_("+6\n\n0\n\n-20\n\n-40\n\n-60")
+				.string_("+%\n\n0\n\n-20\n\n-40\n\n-60".format(dbHead))
 				.align_(\left)
 				.font_(Font.default.size_(9))
 				.fixedWidth_(25)
@@ -407,7 +418,7 @@ EventSchedulerGUI {
 
 			if(scheduler.isPlaying.not) {
 				playButton.value = 1;
-				scheduler.record(outputPath, stems);
+				scheduler.record(outputPath, stems, 15);
 			} {
 				// If already playing, need to restart with recording
 				this.stop;
@@ -455,14 +466,14 @@ EventSchedulerGUI {
 	sliderToDb { |value|
 		var amp;
 		if(value <= 0) { ^(-inf) };
-		amp = value.squared * 6.dbamp;
+		amp = value.squared * dbHead.dbamp;
 		^amp.ampdb;
 	}
 
 	ampToSlider { |amp|
 		var normalized;
 		if(amp <= 0) { ^0 };
-		normalized = (amp / 6.dbamp).clip(0, 1);
+		normalized = (amp / dbHead.dbamp).clip(0, 1);
 		^normalized.sqrt;
 	}
 

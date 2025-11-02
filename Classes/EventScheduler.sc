@@ -149,7 +149,7 @@ EventScheduler {
 			fxNodes: IdentityDictionary.new
 		);
 
-		nodes.put(groupName, gParent);
+		nodes.put(groupName.asString, gParent);
 		buses.put(groupName, bFx);
 
 		if(effectsList.isNil or: { effectsList.isEmpty }) {
@@ -214,7 +214,7 @@ EventScheduler {
 
 				server.bind {
 					var fx = Synth.tail(gFx, synthName, argList.asArray);
-					nodes.put(uid, fx);
+					nodes.put(uid.asString, fx);
 					groupMap[groupName][\fxNodes].put(uid, fx);
 				};
 
@@ -316,7 +316,7 @@ EventScheduler {
 
 	processPfields { |pfields, groupName|
 		var processedArgs = List.new;
-		var entry = groupMap[(groupName ? defaultName).asSymbol] ? { groupMap[defaultName] };
+		var entry = groupMap[(groupName ? defaultName).asSymbol] ? groupMap[defaultName];
 		var targetBusIndex = entry[\srcBus].index;
 		var sawOut = false;
 
@@ -473,13 +473,30 @@ EventScheduler {
 
 	setNode { |nodeId, eventTime, pfields, groupName|
 		var absTime = startTime + eventTime;
-		var args = this.processPfields(pfields, groupName);
+		var args = List.new;
+
+		// Process pfields without bus routing
+		pfields.keysValuesDo { |key, value|
+			var k = key.asSymbol;
+			var v = value;
+
+			if(value.isString) {
+				if(value.every { |c| "0123456789.-".includes(c) }) {
+					v = value.asFloat;
+				};
+			} {
+				if(value.isNil) { v = 0 };
+			};
+
+			args.add(k);
+			args.add(v);
+		};
 
 		SystemClock.schedAbs(absTime, {
 			if(server.serverRunning) {
 				server.bind {
 					var node = nodes.at(nodeId);
-					if(node.notNil) { node.set(*args) };
+					if(node.notNil) { node.set(*args.asArray) };
 				};
 			};
 			nil;
