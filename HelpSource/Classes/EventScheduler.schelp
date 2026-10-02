@@ -61,7 +61,7 @@ METHOD:: stop
 Stop now. Frees this play's score group, buses and control buses, nothing else; fires no callback.
 
 METHOD:: record
-Record one pass of the loaded file to disk: the main output (N channels in code::\array:: mode, 2 in code::\fold::) to code::path::, plus one file per track when code::stems:: is true (code::<base>_<track>.<ext>::, at the track's width). The output path may not be the file's own control-envelope code::.wav::.
+Record one pass of the loaded file to disk: the main output (N channels in code::\array:: mode, 2 in code::\fold::) to code::path::, plus one file per track when code::stems:: is true (code::<base>_<track>.<ext>::, at the track's width). Every file is opened before playback starts, so each one begins at the play's first instant. The output path may not be the file's own control-envelope code::.wav::.
 ARGUMENT:: path
 Output file.
 ARGUMENT:: stems

@@ -2,10 +2,10 @@
 //
 // prepare (inside a Routine: allocates and opens the file, syncs), then
 // startMessage gives the /s_new the scheduler sends at playStart, and stop
-// frees the node and closes the file.
+// frees the node and closes the file. bus may be set after prepare.
 
 KSDiskRecorder {
-	var <server, <path, <numChannels, <bus, <target, <addAction;
+	var <server, <path, <numChannels, <>bus, <target, <addAction;
 	var <buffer, <node, <defName, <isOpen;
 
 	*new { |server, path, numChannels, bus, target, addAction = \addToTail|

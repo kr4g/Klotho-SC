@@ -758,31 +758,32 @@ EventScheduler {
 		ext = PathName(path).extension;
 		if(ext.isNil or: { ext.size == 0 }) { ext = "wav" };
 		recordRoutine = Routine({
-			var recs = List.new, mix, numCh, savedLoop, stopAt, mw, token;
+			var recs = List.new, stemRecs = List.new, numCh, savedLoop, stopAt, mw, token;
 			mw = KSMixer.computeMainWidth(payload);
 			numCh = if(effectiveOutput == \array) { mw } { 2 };
 			savedLoop = loop;
 			loop = false;
 			isRecording = true;
-			mix = KSDiskRecorder(server, dir +/+ (base ++ "." ++ ext), numCh, 0, 0, \addToTail);
-			mix.prepare(assets);
-			recs.add(mix);
 			recorders = recs;
+			// Open every file before play: the start messages are tagged at
+			// playStart, only startupDelay ahead, and each file costs two syncs.
+			// Stem buses exist only once play has built the tracks.
+			recs.add(KSDiskRecorder(server, dir +/+ (base ++ "." ++ ext), numCh, 0, 0, \addToTail));
+			if(stems and: { payload.isBare.not }) {
+				(payload.trackNames ++ ["main"]).do { |nm|
+					var r = KSDiskRecorder(server, dir +/+ (base ++ "_" ++ nm ++ "." ++ ext), this.prTrackWidth(nm), nil, 0, \addToTail);
+					recs.add(r);
+					stemRecs.add([nm, r]);
+				};
+			};
+			recs.do { |r| r.prepare(assets) };
 			if(this.play.not) {
 				this.prStopRecorders;
 				loop = savedLoop;
 				^nil
 			};
 			token = stopToken;
-			if(stems and: { mixer.trackMap.notNil }) {
-				(mixer.trackOrder ++ ["main"]).do { |nm|
-					var t = mixer.trackInfo(nm), r;
-					r = KSDiskRecorder(server, dir +/+ (base ++ "_" ++ nm ++ "." ++ ext), t.width, t.fxBus.index, 0, \addToTail);
-					r.prepare(assets);
-					recs.add(r);
-				};
-			};
-			if(token != stopToken) { ^nil };
+			stemRecs.do { |pair| pair[1].bus = mixer.trackInfo(pair[0]).fxBus.index };
 			recs.do { |r| this.prSendTimed(playStart, [r.startMessage(this.nextNodeID)]) };
 			stopAt = playStart + pieceDur + tailPause + ringTime + 0.1;
 			((stopAt - thisThread.seconds).max(0)).wait;
@@ -796,6 +797,13 @@ EventScheduler {
 			recordingCompleteCallback.value(this);
 		}).play(SystemClock);
 		^true
+	}
+
+	// The width KSMixer.build gives a track, read from the load's plan.
+	prTrackWidth { |name|
+		if(plan.isNil) { ^2 };
+		if(name == "main") { ^plan.mainWidth };
+		^plan.widths[name] ? 2
 	}
 
 	// ---- introspection and GUI hooks --------------------------------------------
