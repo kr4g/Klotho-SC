@@ -139,7 +139,7 @@ KSMixer {
 	// Sends the whole topology. `geomBufnum` is the preloaded geometry buffer
 	// (fold mode) or nil. Throws on a refusal; whatever was created by then is
 	// the caller's to free (freeNow).
-	build { |payload, mode, geomBufnum, stemTaps = false, monitoring = false|
+	build { |payload, mode, geomBufnum, stemTaps = false, monitoring = false, binauralStems = false|
 		var names, mainSrcBus, mainFxBus, allTracks, insertSpecs, narrow, outGain;
 		isBare = payload.isBare;
 		outputMode = mode;
@@ -267,35 +267,71 @@ KSMixer {
 
 		if(trackMap["default"].isNil) { trackMap["default"] = trackMap["main"] };
 
-		if(stemTaps) { this.setupStemTaps };
+		if(stemTaps) { this.setupStemTaps(binauralStems, geomBufnum) };
 		if(monitoring) { this.setupMeters };
 		^this
 	}
 
-	// scheduler_score.js setupStemTaps: one stereo router per non-main track,
-	// after its summing router, onto hardware outputs 2+2i.
-	setupStemTaps {
-		var names = trackOrder, layout = List.new, folded = List.new;
+	// scheduler_score.js setupStemTaps: one tap per non-main track, after its
+	// summing router, onto hardware outputs 2+2i. A stereo router by default;
+	// with binaural the track's own __spatialDecodeW on the geometry buffer
+	// (a stereo track decodes through __spatialDecode2 on frames 0-1, where
+	// the mix puts it), so the stems sum to the folded mix. No geometry: the
+	// taps stay routers and the warning says so.
+	setupStemTaps { |binaural = false, geomBufnum|
+		var names = trackOrder, layout = List.new, folded = List.new, decode = binaural;
 		if(trackMap.isNil) { ^nil };
 		if(names.size > 15) {
 			scheduler.warn("[Klotho] stems: only the first 15 of % tracks get separate stems (output-channel limit).".format(names.size));
 			names = names.copyRange(0, 14);
 		};
+		if(decode and: { geomBufnum.isNil }) {
+			scheduler.warn("[Klotho] binaural stems: this score has no speaker geometry to fold with (a labels-only array, or no array), so the stems cannot be decoded; recording plain stereo stems instead. Declare the track with a SpeakerArray for a binaural pass.");
+			decode = false;
+		};
 		names.do { |nm, i|
 			var track = trackMap[nm], outCh = 2 + (2 * i), tapId;
 			if(track.notNil and: { track.routerNode.notNil }) {
-				if(track.width > 2) { folded.add(nm) };
 				tapId = scheduler.nextNodeID;
-				scheduler.sendMsg('/s_new', ['__busRouter', tapId, 3, track.routerNode,
-					'inBus', track.fxBus.index, 'outBus', outCh, 'gain', 1.0]);
-				layout.add((name: nm, ch: [outCh, outCh + 1]));
+				if(decode) {
+					scheduler.sendMsg('/s_new', [KSAssets.decoderDefName(track.width), tapId, 3, track.routerNode,
+						'inBus', track.fxBus.index, 'outBus', outCh, 'bufnum', geomBufnum, 'gain', 1.0]);
+					layout.add((name: nm, ch: [outCh, outCh + 1], decoded: true));
+				} {
+					if(track.width > 2) { folded.add(nm) };
+					scheduler.sendMsg('/s_new', ['__busRouter', tapId, 3, track.routerNode,
+						'inBus', track.fxBus.index, 'outBus', outCh, 'gain', 1.0]);
+					layout.add((name: nm, ch: [outCh, outCh + 1]));
+				};
 			};
 		};
 		if(folded.size > 0) {
-			scheduler.warn("[Klotho] stems: % have more than two speakers, and a stem is a stereo pair -- those stems carry speakers 1 and 2 only.".format(folded.join(", ")));
+			scheduler.warn("[Klotho] stems: % have more than two speakers, and a stem is a stereo pair -- those stems carry speakers 1 and 2 only. Record with binaural: true to decode every stem through the headphone fold.".format(folded.join(", ")));
 		};
 		stemLayout = layout.asArray;
 		^stemLayout
+	}
+
+	// The same decoders, each onto a private stereo bus for a DiskOut, which
+	// is how record(binaural: true) writes its stems on a server with any
+	// number of outputs. Returns name -> Bus; the buses free with the play.
+	setupStemDecoders { |geomBufnum|
+		var result = Dictionary.new;
+		if(trackMap.isNil) { ^result };
+		if(geomBufnum.isNil) {
+			Error("[Klotho] binaural stems need the geometry buffer, which this file does not provide (no speaker positions)").throw
+		};
+		trackOrder.do { |nm|
+			var track = trackMap[nm], bus, id;
+			if(track.notNil and: { track.routerNode.notNil }) {
+				bus = this.allocBus(2);
+				id = scheduler.nextNodeID;
+				scheduler.sendMsg('/s_new', [KSAssets.decoderDefName(track.width), id, 3, track.routerNode,
+					'inBus', track.fxBus.index, 'outBus', bus.index, 'bufnum', geomBufnum, 'gain', 1.0]);
+				result[nm] = bus;
+			};
+		};
+		^result
 	}
 
 	// GUI meters: a tap after each router, reading the post-fader bus.

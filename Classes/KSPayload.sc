@@ -158,7 +158,14 @@ KSPayload {
 					stride: KSJSON.int(d["stride"]),
 					coefficients: (d["coefficients"] ?? { [] }).collect { |x| KSJSON.num(x) ? 0.0 },
 					maxDelay: KSJSON.num(d["maxDelay"]),
-					fields: (d["fields"] ?? { [] }).collect { |x| KSJSON.str(x) }
+					fields: (d["fields"] ?? { [] }).collect { |x| KSJSON.str(x) },
+					// The travel scale the table was written at, and the unscaled
+					// propagation part of each lane's delay (seconds), so the
+					// player can re-scale without the geometry. Absent in files
+					// written before the scale existed.
+					travel: KSJSON.num(d["travel"]) ? 1.0,
+					shadowIldDb: KSJSON.num(d["shadowIldDb"]) ? 0.0,
+					travelDelays: d["travelDelays"] !? { |td| td.collect { |x| KSJSON.num(x) ? 0.0 } }
 				);
 			};
 			arrays[id.asString] = (

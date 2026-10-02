@@ -74,8 +74,16 @@ ARGUMENT:: path
 Output file.
 ARGUMENT:: stems
 Also write per-track files.
+ARGUMENT:: binaural
+Decode every stem through the headphone fold: one code::__spatialDecodeN:: per track on the geometry buffer, after the track's summing router, so each stem is a stereo file of the whole track as the listener hears it and the stems sum to the mix. Needs a file with speaker positions and code::output = \fold::; refused otherwise, naming the fix. No code::_main:: stem is written in this mode (the mix file is the decoded main).
 ARGUMENT:: onComplete
 Called when the files are closed.
+
+METHOD:: travel
+The headphone fold's travel scale: code::nil:: (default) plays the file's own decoder table; a number from 0 to 1 re-scales the propagation part of every delay (1.0 the venue as built, 0.1 and 0.03 compact, 0 interaural cues only) from the file's code::travelDelays::, which code::Score.write:: records. A file without them is refused at load. Takes effect at once when the geometry is already on the server.
+
+METHOD:: binauralStems
+With code::stemTaps::, the hardware stem taps are the per-track decoders rather than stereo routers (the browser's binaural record pass).
 
 METHOD:: output
 code::\array:: (hardware outputs 0..N-1), code::\fold:: (binaural decode onto outputs 0/1) or code::nil:: for automatic: code::\array:: when the server has at least N outputs. Changing it after a load reloads the file.
@@ -146,6 +154,11 @@ e.stop;
 // a 24-speaker file on a 24-output interface
 e.output = \array;
 e.loadFile("spatial_piece.json", { |ok| if(ok) { e.record("spatial_piece_render.wav", stems: true) } });
+
+// the same file to headphones: a stereo mix and one stereo stem per track, compact travel
+e.output = \fold;
+e.travel = 0.03;
+e.loadFile("spatial_piece.json", { |ok| if(ok) { e.record("spatial_piece_binaural.wav", stems: true, binaural: true) } });
 
 // trace every message in the parity format
 t = KSTrace("trace.jsonl", (source: "native", firstPrivateAudioBus: s.options.firstPrivateBus));

@@ -9,7 +9,7 @@ EventSchedulerGUI {
 	var <scheduler, <server;
 	var <window;
 	var <fileNameLabel, <statusLabel;
-	var <loadButton, <playButton, <recordButton, <stemsCheckbox, <loopMenu, <outputMenu;
+	var <loadButton, <playButton, <recordButton, <stemsCheckbox, <binauralCheckbox, <loopMenu, <outputMenu;
 	var <trackContainer, <trackViews, <levelUpdateTask, <trackOrder;
 	var <currentFilePath;
 	var <dbHead;
@@ -75,6 +75,7 @@ EventSchedulerGUI {
 		});
 
 		stemsCheckbox = CheckBox().value_(false);
+		binauralCheckbox = CheckBox().value_(false);
 
 		loopMenu = PopUpMenu()
 		.items_(["Loop: off", "Loop: ∞", "Loop ×2", "Loop ×4", "Loop ×8"])
@@ -106,6 +107,8 @@ EventSchedulerGUI {
 			recordButton.fixedWidth_(60),
 			stemsCheckbox,
 			StaticText().string_("Stems").fixedWidth_(40),
+			binauralCheckbox,
+			StaticText().string_("Binaural").fixedWidth_(55),
 			loopMenu.fixedWidth_(110),
 			outputMenu.fixedWidth_(130),
 			nil
@@ -307,7 +310,7 @@ EventSchedulerGUI {
 	}
 
 	startRecording {
-		var pathName, dir, base, outputPath, stems;
+		var pathName, dir, base, outputPath, stems, binaural;
 		if(currentFilePath.isNil) {
 			this.setStatus("No file loaded - cannot record");
 			recordButton.value = 0;
@@ -319,10 +322,11 @@ EventSchedulerGUI {
 		// Never <stem>.wav: that is the file's control-envelope buffer.
 		outputPath = dir +/+ (base ++ "_render.wav");
 		stems = stemsCheckbox.value;
+		binaural = binauralCheckbox.value;
 		recordButton.value = 1;
 		playButton.value = 1;
 		this.startLevelMonitoring;
-		scheduler.record(outputPath, stems, { |sched|
+		scheduler.record(outputPath, stems, binaural, { |sched|
 			defer {
 				if(window.notNil and: { window.isClosed.not }) {
 					playButton.value = 0;

@@ -26,4 +26,9 @@ METHOD:: effectiveGain
 Router gains (fader, mute, solo) that persist across builds.
 
 METHOD:: setupStemTaps
+Hardware stem taps after each summing router: stereo routers, or with code::binaural:: the per-track decoders on the geometry buffer.
+
+METHOD:: setupStemDecoders
+The per-track decoders onto private stereo buses, for code::record(binaural: true)::; returns name -> Bus.
+
 METHOD:: setupMeters

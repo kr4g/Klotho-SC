@@ -52,7 +52,7 @@ EventScheduler {
 	var <assets, <payload, <mixer;
 	var <isPlaying, <isReady, <isRecording;
 	var <playStart, <>startupDelay, <>latency, <>ringTime, <>tailPause;
-	var <>loop, <output, <>stemTaps;
+	var <>loop, <output, <>stemTaps, <>binauralStems, <travel;
 	var <>onFinish, <>onIdle, <>onEvent, <>onLoad;
 	var <>oscTap, <>debug, <>enableMonitoring, <>allowUnknownDefs, <>postWarnings;
 	var <>maxBundleBytes, <>maxBundleMsgs;
@@ -82,6 +82,8 @@ EventScheduler {
 		loop = false;
 		output = nil;
 		stemTaps = false;
+		binauralStems = false;
+		travel = nil;
 		postWarnings = true;
 		allowUnknownDefs = false;
 		maxBundleBytes = 8192;
@@ -125,6 +127,46 @@ EventScheduler {
 			resolved = this.prResolveOutput;
 			if(resolved != effectiveOutput) { this.loadFile(loadedFilePath) };
 		};
+	}
+
+	// The headphone fold's travel scale: nil plays the file's own table, a
+	// number from 0 to 1 re-scales the propagation part of every delay
+	// (1.0 the venue as built, 0.1 and 0.03 compact; the interaural cues do
+	// not move). Needs a file whose decoder carries travelDelays, which
+	// Score.write has written since the scale existed. Takes effect on the
+	// next load, or at once when the geometry is already on the server.
+	travel_ { |scale|
+		if(scale.notNil) {
+			if(scale.isNumber.not or: { scale.isNaN } or: { scale < 0 } or: { scale > 1 }) {
+				Error("EventScheduler: travel must be nil or a number from 0 to 1").throw
+			};
+		};
+		travel = scale;
+		if(geomBufnum.notNil and: { plan.notNil } and: { plan.decoder.notNil }) {
+			this.prSetnChunks(geomBufnum, this.prGeometryTable(plan));
+		};
+	}
+
+	// The decoder table at this player's travel scale: the file's own, or
+	// its delays moved by (travel - fileTravel) * travelDelays[lane].
+	prGeometryTable { |spatialPlan|
+		var dec = spatialPlan.decoder, table, shift, n;
+		if(travel.isNil or: { travel == dec.travel }) { ^dec.coefficients };
+		n = spatialPlan.mainWidth;
+		if(dec.travelDelays.isNil or: { dec.travelDelays.size != n }) {
+			Error("EventScheduler: travel = % asks for a re-scaled fold, but this file's decoder carries no travelDelays (it was written before the scale existed, or by hand). Write it again with Score.write, which records them, or set travel = nil to play the file's own table.".format(travel)).throw
+		};
+		shift = travel - dec.travel;
+		table = dec.coefficients.copy;
+		n.do { |lane|
+			var base = lane * 6, d = shift * dec.travelDelays[lane];
+			table[base] = table[base] + d;
+			table[base + 1] = table[base + 1] + d;
+			if(table[base] < 0 or: { table[base + 1] < 0 }) {
+				Error("EventScheduler: re-scaling lane % to travel % gives a negative delay; the file's travelDelays do not match its table".format(lane, travel)).throw
+			};
+		};
+		^table
 	}
 
 	loadSynthDefDir { |path|
@@ -284,7 +326,11 @@ EventScheduler {
 		if(p.hasControlEnvelopes) { this.prUploadControlBuffer(p) };
 		if(plan.notNil and: { plan.decoder.notNil }
 			and: { (effectiveOutput == \fold) or: { plan.mainWidth <= 2 } }) {
-			this.prUploadGeometry(plan);
+			try { this.prUploadGeometry(plan) } { |e|
+				lastError = e.errorString;
+				this.prError("playback could not start: " ++ lastError);
+				^false
+			};
 		};
 		this.prSync;
 		isReady = true;
@@ -300,10 +346,11 @@ EventScheduler {
 	}
 
 	prUploadGeometry { |spatialPlan|
+		var table = this.prGeometryTable(spatialPlan);
 		geomBufnum = server.bufferAllocator.alloc(1);
 		this.sendMsg('/b_alloc', [geomBufnum, spatialPlan.mainWidth, 6]);
 		this.prSync;
-		this.prSetnChunks(geomBufnum, spatialPlan.decoder.coefficients);
+		this.prSetnChunks(geomBufnum, table);
 	}
 
 	// /b_setn in runs of 200 values, as the browser does.
@@ -359,7 +406,7 @@ EventScheduler {
 		warnedGroups = Set.new;
 		warnedBufs = Set.new;
 		try {
-			mixer.build(payload, effectiveOutput, geomBufnum, stemTaps, enableMonitoring);
+			mixer.build(payload, effectiveOutput, geomBufnum, stemTaps, enableMonitoring, binauralStems);
 			this.prSetupControlEnvelopes;
 		} { |err|
 			this.prAbortPlaySetup(err);
@@ -935,11 +982,28 @@ EventScheduler {
 	// \array mode, 2 in \fold) to `path`, plus one file per track when `stems`
 	// is true (<base>_<track>.<ext>, each at the track's width). Never writes
 	// the control-envelope .wav.
-	record { |path, stems = false, onComplete|
+	//
+	// binaural: the mix is the headphone fold (so the output must be \fold)
+	// and each stem is decoded by its own __spatialDecodeW on the geometry
+	// buffer, after the track's summing router, onto a private stereo bus:
+	// <base>_<track>.<ext> is then a stereo file of the whole track as the
+	// listener hears it, and the stems sum to the mix. No _main stem is
+	// written in that mode: the mix file is the decoded main.
+	record { |path, stems = false, binaural = false, onComplete|
 		var dir, base, ext;
 		if(payload.isNil or: { isReady.not }) {
 			this.prError("record: no file loaded");
 			^false
+		};
+		if(binaural) {
+			if(plan.isNil or: { plan.decoder.isNil }) {
+				this.prError("record: binaural needs a speaker array with positions, and this file has no geometry to fold with; declare the track with a SpeakerArray and write it again");
+				^false
+			};
+			if(effectiveOutput != \fold) {
+				this.prError("record: binaural records the headphone fold, and this player's output is \\" ++ effectiveOutput ++ "; set output = \\fold (which reloads the file) and record again");
+				^false
+			};
 		};
 		path = path.standardizePath;
 		if(payload.wavPath.notNil and: { path == payload.wavPath.standardizePath }) {
@@ -964,8 +1028,10 @@ EventScheduler {
 			// Stem buses exist only once play has built the tracks.
 			recs.add(KSDiskRecorder(server, dir +/+ (base ++ "." ++ ext), numCh, 0, 0, \addToTail));
 			if(stems and: { payload.isBare.not }) {
-				(payload.trackNames ++ ["main"]).do { |nm|
-					var r = KSDiskRecorder(server, dir +/+ (base ++ "_" ++ nm ++ "." ++ ext), this.prTrackWidth(nm), nil, 0, \addToTail);
+				var names = if(binaural) { payload.trackNames } { payload.trackNames ++ ["main"] };
+				names.do { |nm|
+					var w = if(binaural) { 2 } { this.prTrackWidth(nm) };
+					var r = KSDiskRecorder(server, dir +/+ (base ++ "_" ++ nm ++ "." ++ ext), w, nil, 0, \addToTail);
 					recs.add(r);
 					stemRecs.add([nm, r]);
 				};
@@ -977,7 +1043,12 @@ EventScheduler {
 				^nil
 			};
 			token = stopToken;
-			stemRecs.do { |pair| pair[1].bus = mixer.trackInfo(pair[0]).fxBus.index };
+			if(binaural and: { stemRecs.size > 0 }) {
+				var decoded = mixer.setupStemDecoders(geomBufnum);
+				stemRecs.do { |pair| pair[1].bus = decoded[pair[0]].index };
+			} {
+				stemRecs.do { |pair| pair[1].bus = mixer.trackInfo(pair[0]).fxBus.index };
+			};
 			recs.do { |r| this.prSendTimed(playStart, [List[r.startMessage(this.nextNodeID)]], token) };
 			stopAt = playStart + pieceDur + tailPause + ringTime + 0.1;
 			((stopAt - thisThread.seconds).max(0)).wait;
