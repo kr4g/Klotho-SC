@@ -31,6 +31,11 @@ EventScheduler {
 
 	var <>recordingCompleteCallback;
 
+	var <controlGroup;
+	var <controlEnvelopes;
+	var <controlBuses;
+	var <controlBuffer;
+
 	*new { |server, maxEvents=500, batchOverlapRatio=0.8, startLag=0.5, debug=false, enableMonitoring=false|
 		^super.new.init(server, maxEvents, batchOverlapRatio, startLag, debug, enableMonitoring)
 	}
@@ -251,6 +256,12 @@ EventScheduler {
 					DiskOut.ar(bufnum, sig);
 				}).add;
 			};
+			if(SynthDescLib.global.at(\__klEnvCtrl).isNil) {
+				SynthDef(\__klEnvCtrl, { |bufnum=0, bus=0, dur=1, startFrame=0, numFrames=512|
+					var phase = Line.kr(startFrame, startFrame + numFrames - 1, dur, doneAction: 2);
+					Out.kr(bus, BufRd.kr(1, bufnum, phase, interpolation: 2));
+				}).add;
+			};
 			server.sync;
 			isReady = true;
 		}).play;
@@ -266,6 +277,89 @@ EventScheduler {
 
 	getAllBusSynths {
 		^busSynths;
+	}
+
+	initControlEnvelopes { |meta, bufferPath|
+		var ctrlEnvSpecs = (meta ? Dictionary.new)["controlEnvelopes"];
+
+		controlEnvelopes = nil;
+		controlBuses = nil;
+		controlBuffer = nil;
+		controlGroup = nil;
+
+		if(ctrlEnvSpecs.isNil or: { ctrlEnvSpecs.isEmpty }) { ^this };
+
+		controlGroup = Group.head(server.defaultGroup);
+
+		if(bufferPath.notNil and: { File.exists(bufferPath) }) {
+			controlBuffer = Buffer.read(server, bufferPath);
+			server.sync;
+		};
+
+		controlEnvelopes = List.new;
+		controlBuses = IdentityDictionary.new;
+
+		ctrlEnvSpecs.do { |spec, i|
+			var bus = Bus.control(server, 1);
+			var desc = (
+				blockIndex: spec["blockIndex"].asInteger,
+				start: spec["start"].asFloat,
+				dur: spec["dur"].asFloat,
+				pfields: spec["pfields"],
+				targetIds: spec["targetIds"],
+				bus: bus
+			);
+			controlEnvelopes.add(desc);
+			controlBuses.put(i, bus);
+		};
+	}
+
+	scheduleControlEnvelopes {
+		if(controlEnvelopes.isNil or: { controlEnvelopes.isEmpty }) { ^this };
+		if(controlBuffer.isNil) { ^this };
+
+		controlEnvelopes.do { |desc|
+			var absTime = startTime + desc.start;
+			var blockSize = 512;
+			var startFrame = desc.blockIndex * blockSize;
+			var bus = desc.bus;
+
+			SystemClock.schedAbs(absTime, {
+				if(server.serverRunning) {
+					server.bind {
+						Synth(\__klEnvCtrl, [
+							\bufnum, controlBuffer.bufnum,
+							\bus, bus.index,
+							\dur, desc.dur,
+							\startFrame, startFrame,
+							\numFrames, blockSize
+						], controlGroup);
+					};
+				};
+				nil;
+			});
+		};
+	}
+
+	mapControlToNode { |nodeId, eventId|
+		if(controlEnvelopes.isNil) { ^this };
+
+		controlEnvelopes.do { |desc|
+			var targetIds = desc.targetIds;
+			if(targetIds.notNil) {
+				targetIds.do { |tid|
+					if(tid == eventId) {
+						var node = nodes.at(nodeId);
+						var paramNames = desc.pfields;
+						if(node.notNil and: { paramNames.notNil }) {
+							paramNames.do { |pname|
+								node.map(pname.asSymbol, desc.bus.index);
+							};
+						};
+					};
+				};
+			};
+		};
 	}
 
 	loadFile { |path|
@@ -309,6 +403,12 @@ EventScheduler {
 			nextEventIndex = 0;
 
 			this.initGroupsAndInserts(jsonData["meta"]);
+
+			// Load control envelopes if present
+			block {
+				var bufPath = path.replace(".json", ".wav");
+				this.initControlEnvelopes(jsonData["meta"], bufPath);
+			};
 		}).play;
 
 		^true;
@@ -465,6 +565,7 @@ EventScheduler {
 					nodes.put(synthId, synth);
 					nodeWatcher.register(synth);
 					synth.onFree { nodes.removeAt(synthId) };
+					this.mapControlToNode(synthId, synthId);
 				};
 			};
 			nil;
@@ -553,6 +654,7 @@ EventScheduler {
 
 		"Starting playback...".postln;
 
+		this.scheduleControlEnvelopes;
 		this.scheduleBatch(0);
 
 		^true;
