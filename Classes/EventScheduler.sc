@@ -989,7 +989,10 @@ EventScheduler {
 	// <base>_<track>.<ext> is then a stereo file of the whole track as the
 	// listener hears it, and the stems sum to the mix. No _main stem is
 	// written in that mode: the mix file is the decoded main.
-	record { |path, stems = false, binaural = false, onComplete|
+	//
+	// sampleFormat: any of scsynth's ("int16", "int24", "int32", "float"); "float"
+	// keeps a pass that runs over full scale unclipped, for scaling afterwards.
+	record { |path, stems = false, binaural = false, onComplete, sampleFormat = "int24"|
 		var dir, base, ext;
 		if(payload.isNil or: { isReady.not }) {
 			this.prError("record: no file loaded");
@@ -1036,7 +1039,7 @@ EventScheduler {
 					stemRecs.add([nm, r]);
 				};
 			};
-			recs.do { |r| r.prepare(assets) };
+			recs.do { |r| r.prepare(assets, "wav", sampleFormat) };
 			if(this.play.not) {
 				this.prStopRecorders;
 				loop = savedLoop;

@@ -78,6 +78,8 @@ ARGUMENT:: binaural
 Decode every stem through the headphone fold: one code::__spatialDecodeN:: per track on the geometry buffer, after the track's summing router, so each stem is a stereo file of the whole track as the listener hears it and the stems sum to the mix. Needs a file with speaker positions and code::output = \fold::; refused otherwise, naming the fix. No code::_main:: stem is written in this mode (the mix file is the decoded main).
 ARGUMENT:: onComplete
 Called when the files are closed.
+ARGUMENT:: sampleFormat
+Sample format of every file written: code::"int24":: (default), code::"int16"::, code::"int32":: or code::"float"::. An integer file clips anything over full scale; code::"float":: keeps a loud pass intact, to be scaled afterwards.
 
 METHOD:: travel
 The headphone fold's travel scale: code::nil:: (default) plays the file's own decoder table; a number from 0 to 1 re-scales the propagation part of every delay (1.0 the venue as built, 0.1 and 0.03 compact, 0 interaural cues only) from the file's code::travelDelays::, which code::Score.write:: records. A file without them is refused at load. Takes effect at once when the geometry is already on the server.
