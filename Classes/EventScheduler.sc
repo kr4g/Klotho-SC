@@ -1,805 +1,842 @@
+// EventScheduler: plays a Klotho Score.write file on a native scsynth with the
+// semantics of Klotho's SuperSonic engine (scheduler_core.js and
+// scheduler_score.js), message for message:
+//
+//   * loadFile(path) decodes the file (KSPayload), checks every SynthDef it
+//     needs is known, loads sample buffers, uploads the control-envelope
+//     buffer (<stem>.wav) and the decoder geometry. Every refusal happens here,
+//     before a node exists.
+//   * play builds the topology (KSMixer) under one score group, sets up the
+//     control envelopes (one control bus per descriptor, preset with /c_set),
+//     then walks the send plan: events and envelope synths merged by start,
+//     one time-tagged bundle per distinct instant, sent `latency` seconds
+//     ahead. Nothing is ever dropped for being late or for being dense.
+//   * new -> /s_new at the head of the track's src group with out = srcBus +
+//     speakerLane; releaseAfter + dur + a gated def -> /n_set gate 0 at
+//     start + dur; set -> /n_set (out re-pointed); release -> gate 0 on gated
+//     defs; envelope targets -> /n_map at the event, or deferred to startTime.
+//   * finish at pieceDur + tailPause (onFinish), the score group freed after
+//     ringTime, onIdle 0.25 s later. stop frees the score group only: nothing
+//     else on the server is touched and no callback fires.
+//   * loop: true, or an integer number of cycles. Envelopes map and fire on
+//     every cycle (the browser maps them on none while looping; see NOTES).
+//
+// oscTap sees every message: a KSTrace, or a Function(t, addr, args, sent,
+// flags). Spatial files play on the hardware array (\array) or through the
+// binaural fold (\fold); the default is \array when the server has enough
+// outputs.
+
 EventScheduler {
 	var <server;
-	var <nodes;
-	var <buses;
-	var <events;
-	var <isPlaying;
-	var <startTime;
-	var <startLag;
-	var <>debug;
-	var nodeWatcher;
-	var <maxEvents;
-	var <batchOverlapRatio;
-	var nextEventIndex;
-	var lastScheduledTime;
-	var nextBatchTask;
-
-	var <groupMap;     // \name -> (group, srcGroup, fxGroup, srcBus, fxBus, fxNodes)
-	var <defaultName;
-
-	var <mainGroup;
-	var <mainBus;
-
-	var <groupOrder;
-	var <busSynths;
-
-	var <loadedFilePath;
-
-	var <enableMonitoring;
-
-	var <isReady;
-
+	var <assets, <payload, <mixer;
+	var <isPlaying, <isReady, <isRecording;
+	var <playStart, <>startupDelay, <>latency, <>ringTime, <>tailPause;
+	var <>loop, <output, <>stemTaps;
+	var <>onFinish, <>onIdle, <>onEvent, <>onLoad;
+	var <>oscTap, <>debug, <>enableMonitoring, <>allowUnknownDefs, <>postWarnings;
+	var <>maxBundleBytes;
 	var <>recordingCompleteCallback;
+	var <loadedFilePath, <lastError, <effectiveOutput, <pieceDur, <lastSentTag;
+	var <plan;
+	var stopToken, playRoutine, loadRoutine, recordRoutine, deferredRings;
+	var nodeMap, defNameMap, warnedGroups, warnedBufs;
+	var <controlBusMap, controlGroup, controlBuses, ctrlBufnum, geomBufnum;
+	var recorders;
+	var <sampleMap;
 
-	var <controlGroup;
-	var <controlEnvelopes;
-	var <controlBuses;
-	var <controlBuffer;
-
-	*new { |server, maxEvents=500, batchOverlapRatio=0.8, startLag=0.5, debug=false, enableMonitoring=false|
-		^super.new.init(server, maxEvents, batchOverlapRatio, startLag, debug, enableMonitoring)
+	*new { |server, startupDelay = 0.1, latency, ringTime = 5, enableMonitoring = false, debug = false|
+		^super.new.init(server, startupDelay, latency, ringTime, enableMonitoring, debug)
 	}
 
-	init { |serverArg, maxEventsArg, overlapRatioArg, lag, debugFlag, monitorFlag|
-		server = serverArg;
-		maxEvents = maxEventsArg;
-		batchOverlapRatio = overlapRatioArg;
-		startLag = lag;
-		debug = debugFlag;
-		enableMonitoring = monitorFlag;
-		isReady = false;
-
-		events = Array.new;
-		nodes = Dictionary.new;
-		buses = Dictionary.new;
+	init { |argServer, argStartupDelay, argLatency, argRingTime, argMonitoring, argDebug|
+		server = argServer ? Server.default;
+		startupDelay = argStartupDelay;
+		latency = argLatency ? server.latency ? 0.2;
+		ringTime = argRingTime;
+		enableMonitoring = argMonitoring;
+		debug = argDebug;
+		tailPause = 0;
+		loop = false;
+		output = nil;
+		stemTaps = false;
+		postWarnings = true;
+		allowUnknownDefs = false;
+		maxBundleBytes = 8192;
 		isPlaying = false;
-		nextEventIndex = 0;
-
-		nodeWatcher = NodeWatcher.new(server);
-
-		groupOrder = Array.new;
-		busSynths = IdentityDictionary.new;
-
-		defaultName = \default;
-
-		CmdPeriod.add({ isPlaying = false; nextEventIndex = 0 });
-
-		this.loadSynthDefs;
+		isReady = false;
+		isRecording = false;
+		stopToken = 0;
+		deferredRings = List.new;
+		nodeMap = Dictionary.new;
+		defNameMap = Dictionary.new;
+		warnedGroups = Set.new;
+		warnedBufs = Set.new;
+		controlBusMap = [];
+		controlBuses = List.new;
+		recorders = List.new;
+		sampleMap = Dictionary.new;
+		assets = KSAssets(server);
+		mixer = KSMixer(this);
 	}
 
-	initGroupsAndInserts { |meta|
-		var names = ((meta ? Dictionary.new)["groups"] ? #[]).collect(_.asSymbol);
-		var inserts = (meta ? Dictionary.new)["inserts"];
-		var insertMap = IdentityDictionary.new;
+	// ---- configuration -------------------------------------------------------
 
-		groupOrder = names.copy;
-		groupMap = IdentityDictionary.new;
-		busSynths.clear;
-
-		if(inserts.notNil) {
-			inserts.keysValuesDo { |trackName, spec|
-				var effects = List.new;
-				var specs = if(spec.isKindOf(Array)) { spec } { [spec] };
-
-				specs.do { |item|
-					var uid = item["uid"].asSymbol;
-					var synthName = item["synthName"].asSymbol;
-					var args = item["args"];
-					effects.add((
-						uid: uid,
-						synthName: synthName,
-						args: args
-					));
-				};
-
-				insertMap[trackName.asSymbol] = effects;
-			};
+	// \array (hardware 0..N-1), \fold (binaural decode to 0/1) or nil (auto:
+	// \array when the server has at least N outputs). Changing it after a load
+	// reloads the file, because the fold needs the geometry buffer.
+	output_ { |mode|
+		var resolved;
+		if(mode.notNil and: { #[\array, \fold].includes(mode).not }) {
+			Error("EventScheduler: output must be \\array, \\fold or nil").throw
 		};
-
-		names.do { |nm|
-			this.createGroupWithInserts(nm, insertMap[nm]);
-		};
-
-		this.createGroupWithInserts(\main, insertMap[\main]);
-
-		mainBus = groupMap[\main][\fxBus];
-		mainGroup = groupMap[\main][\group];
-
-		server.bind {
-			var synthName = if(enableMonitoring) { \__busRouterMonitor } { \__busRouter };
-			var args = if(enableMonitoring) {
-				[\inBus, mainBus.index, \outBus, 0, \gain, 1.0, \id, groupOrder.size]
-			} {
-				[\inBus, mainBus.index, \outBus, 0, \gain, 1.0]
-			};
-			var mainBusSynth = Synth.tail(groupMap[\main][\group], synthName, args);
-			busSynths[\main] = mainBusSynth;
-			nodes.put(\__main_bus_synth, mainBusSynth);
-		};
-
-		groupMap.keysValuesDo { |nm, entry|
-			if(nm != \main) {
-				var gParent = entry[\group];
-				var bFx = entry[\fxBus];
-				var mainSrcBus = groupMap[\main][\srcBus];
-				var idx = groupOrder.indexOf(nm);
-				server.bind {
-					var synthName = if(enableMonitoring) { \__busRouterMonitor } { \__busRouter };
-					var args = if(enableMonitoring) {
-						[\inBus, bFx.index, \outBus, mainSrcBus.index, \gain, 1.0, \id, idx]
-					} {
-						[\inBus, bFx.index, \outBus, mainSrcBus.index, \gain, 1.0]
-					};
-					var groupBusSynth = Synth.tail(gParent, synthName, args);
-					busSynths[nm] = groupBusSynth;
-					nodes.put(("__" ++ nm.asString ++ "_bus_synth").asSymbol, groupBusSynth);
-				};
-			};
+		output = mode;
+		if(payload.notNil and: { loadedFilePath.notNil }) {
+			resolved = this.prResolveOutput;
+			if(resolved != effectiveOutput) { this.loadFile(loadedFilePath) };
 		};
 	}
 
-	createGroupWithInserts { |groupName, effectsList|
-		var gParent = Group.tail(server.defaultGroup);
-		var gSrc = Group.head(gParent);
-		var gFx = Group.after(gSrc);
-		var bSrc = Bus.audio(server, 2);
-		var bFx = Bus.audio(server, 2);
-
-		groupMap[groupName] = (
-			group: gParent,
-			srcGroup: gSrc,
-			fxGroup: gFx,
-			srcBus: bSrc,
-			fxBus: bFx,
-			fxNodes: IdentityDictionary.new
-		);
-
-		nodes.put(groupName.asString, gParent);
-		buses.put(groupName, bFx);
-
-		if(effectsList.isNil or: { effectsList.isEmpty }) {
-			server.bind {
-				var bypass = Synth.head(gFx, \__busRouter, [
-					\inBus, bSrc.index,
-					\outBus, bFx.index,
-					\gain, 1.0
-				]);
-				groupMap[groupName][\fxNodes].put(\__bypass, bypass);
-			};
-		} {
-			var stageBuses = Array.newClear(effectsList.size - 1).collect { Bus.audio(server, 2) };
-			var prevBus = bSrc;
-			var nextBus;
-
-			effectsList.do { |effect, i|
-				var uid = effect.uid;
-				var synthName = effect.synthName;
-				var initialArgs = effect.args;
-				var desc = SynthDescLib.global.at(synthName);
-				var inParam, outParam;
-				var argList;
-
-				nextBus = if(i < (effectsList.size - 1)) { stageBuses[i] } { bFx };
-
-				if(desc.notNil) {
-					var controlDict = desc.controlDict;
-					inParam = case
-					{ controlDict.includesKey(\in) } { \in }
-					{ controlDict.includesKey(\inbus) } { \inbus }
-					{ controlDict.includesKey(\inBus) } { \inBus }
-					{ \in };
-					outParam = case
-					{ controlDict.includesKey(\out) } { \out }
-					{ controlDict.includesKey(\outbus) } { \outbus }
-					{ controlDict.includesKey(\outBus) } { \outBus }
-					{ \out };
-				} {
-					inParam = \in;
-					outParam = \out;
-				};
-
-				argList = List.new;
-				argList.add(inParam).add(prevBus.index);
-				argList.add(outParam).add(nextBus.index);
-
-				if(initialArgs.notNil) {
-					initialArgs.keysValuesDo { |key, value|
-						var k = key.asSymbol;
-						var v = value;
-
-						if(value.isString) {
-							if(value.every { |c| "0123456789.-".includes(c) }) {
-								v = value.asFloat
-							};
-						};
-
-						argList.add(k).add(v);
-					};
-				};
-
-				server.bind {
-					var fx = Synth.tail(gFx, synthName, argList.asArray);
-					nodes.put(uid.asString, fx);
-					groupMap[groupName][\fxNodes].put(uid, fx);
-				};
-
-				prevBus = nextBus;
-			};
-		};
+	loadSynthDefDir { |path|
+		^assets.loadSynthDefDir(path)
 	}
 
-	loadSynthDefs {
-		Routine({
-			if(SynthDescLib.global.at(\__busRouter).isNil) {
-				SynthDef(\__busRouter, { |inBus=0, outBus=0, gain=1.0|
-					var sig = In.ar(inBus, 2);
-					sig = sig * gain;
-					ReplaceOut.ar(inBus, sig);
-					Out.ar(outBus, sig);
-				}).add;
-			};
-			if(SynthDescLib.global.at(\__busRouterMonitor).isNil) {
-				SynthDef(\__busRouterMonitor, { |inBus=0, outBus=0, gain=1.0, id=0|
-					var amp, peak;
-					var sig = In.ar(inBus, 2);
-					sig = sig * gain;
-					amp = Amplitude.kr(sig, 0.01, 0.1);
-					peak = amp.sum * 0.5;
-					SendReply.kr(Impulse.kr(20), '/trackLevel', [peak, id]);
-					ReplaceOut.ar(inBus, sig);
-					Out.ar(outBus, sig);
-				}).add;
-			};
-			if(SynthDescLib.global.at(\__kl_diskout).isNil) {
-				SynthDef(\__kl_diskout, { |bufnum=0, inbus=0|
-					var sig = In.ar(inbus, 2);
-					DiskOut.ar(bufnum, sig);
-				}).add;
-			};
-			if(SynthDescLib.global.at(\__klEnvCtrl).isNil) {
-				SynthDef(\__klEnvCtrl, { |bufnum=0, bus=0, dur=1, startFrame=0, numFrames=512|
-					var phase = Line.kr(startFrame, startFrame + numFrames - 1, dur, doneAction: 2);
-					Out.kr(bus, BufRd.kr(1, bufnum, phase, interpolation: 2));
-				}).add;
-			};
+	loadKlothoDefs { |dir|
+		^assets.loadKlothoDefs(dir)
+	}
+
+	// ---- messages out ----------------------------------------------------------
+
+	nextNodeID {
+		^server.nextNodeID
+	}
+
+	sendMsg { |addr, args|
+		args = args.asArray;
+		server.sendMsg(addr, *args);
+		this.prTap(nil, addr, args, this.prSentNow, nil);
+	}
+
+	prSentNow {
+		^if(playStart.notNil) { thisThread.seconds - playStart } { nil }
+	}
+
+	prTap { |t, addr, args, sent, flags|
+		if(oscTap.isNil) { ^this };
+		if(oscTap.isKindOf(KSTrace)) { oscTap.tap(t, addr, args, sent, flags) } { oscTap.value(t, addr, args, sent, flags) };
+	}
+
+	prLog { |addr, args|
+		this.prTap(nil, addr, args ? [], this.prSentNow, nil);
+	}
+
+	warn { |text|
+		if(postWarnings) { ("EventScheduler: " ++ text).warn };
+		this.prLog('#warn', [text]);
+	}
+
+	prError { |text|
+		("EventScheduler: " ++ text).error;
+		this.prLog('#error', [text]);
+	}
+
+	log { |text|
+		if(debug) { ("EventScheduler: " ++ text).postln };
+		this.prLog('#debug', [text]);
+	}
+
+	prSync {
+		if(server.serverRunning) {
 			server.sync;
-			isReady = true;
-		}).play;
-	}
-
-	log { |message|
-		if(debug) { message.postln };
-	}
-
-	getBusSynth { |groupName|
-		^busSynths[groupName.asSymbol];
-	}
-
-	getAllBusSynths {
-		^busSynths;
-	}
-
-	initControlEnvelopes { |meta, bufferPath|
-		var ctrlEnvSpecs = (meta ? Dictionary.new)["controlEnvelopes"];
-
-		controlEnvelopes = nil;
-		controlBuses = nil;
-		controlBuffer = nil;
-		controlGroup = nil;
-
-		if(ctrlEnvSpecs.isNil or: { ctrlEnvSpecs.isEmpty }) { ^this };
-
-		controlGroup = Group.head(server.defaultGroup);
-
-		if(bufferPath.notNil and: { File.exists(bufferPath) }) {
-			controlBuffer = Buffer.read(server, bufferPath);
-			server.sync;
-		};
-
-		controlEnvelopes = List.new;
-		controlBuses = IdentityDictionary.new;
-
-		ctrlEnvSpecs.do { |spec, i|
-			var bus = Bus.control(server, 1);
-			var desc = (
-				blockIndex: spec["blockIndex"].asInteger,
-				start: spec["start"].asFloat,
-				dur: spec["dur"].asFloat,
-				pfields: spec["pfields"],
-				targetIds: spec["targetIds"],
-				bus: bus
-			);
-			controlEnvelopes.add(desc);
-			controlBuses.put(i, bus);
+			this.prTap(nil, '/sync', [], this.prSentNow, nil);
 		};
 	}
 
-	scheduleControlEnvelopes {
-		if(controlEnvelopes.isNil or: { controlEnvelopes.isEmpty }) { ^this };
-		if(controlBuffer.isNil) { ^this };
+	registerNode { |id, nodeID, defName|
+		nodeMap[id] = nodeID;
+		defNameMap[id] = defName;
+	}
 
-		controlEnvelopes.do { |desc|
-			var absTime = startTime + desc.start;
-			var blockSize = 512;
-			var startFrame = desc.blockIndex * blockSize;
-			var bus = desc.bus;
+	// ---- loading ----------------------------------------------------------------
 
-			SystemClock.schedAbs(absTime, {
-				if(server.serverRunning) {
-					server.bind {
-						Synth(\__klEnvCtrl, [
-							\bufnum, controlBuffer.bufnum,
-							\bus, bus.index,
-							\dur, desc.dur,
-							\startFrame, startFrame,
-							\numFrames, blockSize
-						], controlGroup);
-					};
-				};
-				nil;
-			});
+	// Load a Score.write file. Runs in its own Routine (buffers need /sync);
+	// `action` is called with (success, scheduler) when it is done.
+	loadFile { |path, action|
+		if(loadRoutine.notNil) { loadRoutine.stop };
+		loadRoutine = Routine({
+			var ok = this.prLoad(path);
+			loadRoutine = nil;
+			action.value(ok, this);
+		}).play(SystemClock);
+		^this
+	}
+
+	// The same, from inside a Routine. Returns true on success.
+	loadFileSync { |path|
+		^this.prLoad(path)
+	}
+
+	// Auto: \array when the server has at least N outputs. A stereo file takes
+	// the same path either way (a stereo router onto hardware 0/1), reported
+	// as \fold, the browser's one and only mode.
+	prResolveOutput {
+		var mw = KSMixer.computeMainWidth(payload);
+		^output ?? { if(mw > 2 and: { server.options.numOutputBusChannels >= mw }) { \array } { \fold } }
+	}
+
+	prLoad { |path|
+		var p, needed, missing, missingSamples, widths, mw, err;
+		this.prTeardownAll;
+		playStart = nil;
+		isReady = false;
+		lastError = nil;
+		payload = nil;
+		plan = nil;
+		p = try { KSPayload.read(path) } { |e| err = e; nil };
+		if(p.isNil) {
+			lastError = "could not load %: %".format(path, if(err.notNil) { err.errorString } { "unreadable" });
+			this.prError(lastError);
+			^false
 		};
-	}
+		payload = p;
+		loadedFilePath = path;
+		p.notes.do { |n| this.prLog('#note', [n]) };
 
-	mapControlToNode { |nodeId, eventId|
-		if(controlEnvelopes.isNil) { ^this };
-
-		controlEnvelopes.do { |desc|
-			var targetIds = desc.targetIds;
-			if(targetIds.notNil) {
-				targetIds.do { |tid|
-					if(tid == eventId) {
-						var node = nodes.at(nodeId);
-						var paramNames = desc.pfields;
-						if(node.notNil and: { paramNames.notNil }) {
-							paramNames.do { |pname|
-								node.map(pname.asSymbol, desc.bus.index);
-							};
-						};
-					};
-				};
+		assets.ensureInfra;
+		mw = KSMixer.computeMainWidth(p);
+		effectiveOutput = this.prResolveOutput;
+		if(p.spatial.notNil) {
+			widths = Set.new;
+			p.spatial.tracks.do { |t|
+				if(t.width.notNil and: { t.width == t.width.round } and: { t.width >= 1 }) { widths.add(t.width.asInteger) };
 			};
+			widths.add(mw);
+			widths.do { |w| assets.ensureWidthFamily(w) };
 		};
-	}
+		if(p.isBare.not) { assets.ensureWidthFamily(2) };
 
-	loadFile { |path|
-		Routine({
-			var file, jsonString, jsonData;
+		plan = try { mixer.spatialPlan(p, effectiveOutput) } { |e| err = e; \refused };
+		if(plan == \refused) {
+			plan = nil;
+			lastError = err.errorString;
+			this.prError("playback could not start: " ++ lastError);
+			^false
+		};
 
-			while({ isReady.not }) { 0.01.wait };
-
-			server.freeAll;
-			server.newBusAllocators;
-			server.sync;
-
-			loadedFilePath = path;
-
-			file = File(path, "r");
-			if(file.isOpen.not) {
-				"ERROR: Could not open file %".format(path).postln;
-				^false;
-			};
-
-			jsonString = file.readAllString;
-			file.close;
-
-			try {
-				jsonData = jsonString.parseJSON;
-			} { |error|
-				try {
-					jsonData = jsonString.parseYAML;
-				} { |yamlError|
-					"ERROR: Could not parse JSON data".postln;
-					^false;
-				};
-			};
-
-			if(jsonData["events"].isNil || jsonData["events"].isKindOf(Array).not) {
-				"ERROR: No 'events' key found or 'events' is not an array".postln;
-				^false;
-			};
-
-			events = jsonData["events"];
-			nextEventIndex = 0;
-
-			this.initGroupsAndInserts(jsonData["meta"]);
-
-			// Load control envelopes if present
-			block {
-				var bufPath = path.replace(".json", ".wav");
-				this.initControlEnvelopes(jsonData["meta"], bufPath);
-			};
-		}).play;
-
-		^true;
-	}
-
-	processPfields { |pfields, groupName|
-		var processedArgs = List.new;
-		var entry = groupMap[(groupName ? defaultName).asSymbol] ? groupMap[defaultName];
-		var targetBusIndex = entry[\srcBus].index;
-		var sawOut = false;
-
-		pfields.keysValuesDo { |key, value|
-			var k = key.asSymbol;
-			var v = value;
-			var isOutKey = (k == \out) or: { k == \outbus } or: { k == \outBus };
-
-			if(isOutKey) {
-				sawOut = true;
-				v = targetBusIndex;
+		needed = p.instrumentDefNames;
+		if(p.isBare.not) { needed = needed.add("__busRouter") };
+		if(p.hasControlEnvelopes) { needed = needed.add("__klEnvCtrl") };
+		needed = needed ++ (p.metaDefNames ? []);
+		missing = assets.missingDefs(needed.asSet.asArray);
+		missing.do { |n| this.prLog('#missingDef', [n]) };
+		if(missing.size > 0) {
+			if(allowUnknownDefs) {
+				this.warn("SynthDef(s) not known to SynthDescLib: % -- played anyway and treated as ungated".format(missing.join(", ")));
 			} {
-				if(value.isString) {
-					if(buses.includesKey(value)) {
-						v = (buses.at(value)).index;
-					} {
-						if(value.every { |c| "0123456789.-".includes(c) }) { v = value.asFloat };
-					};
-				} {
-					if(value.isNil) { v = 0 };
-				};
+				lastError = "missing SynthDef(s): % -- load them with loadSynthDefDir(path) or loadKlothoDefs, or set allowUnknownDefs = true".format(missing.join(", "));
+				this.prError(lastError);
+				^false
 			};
-
-			processedArgs.add(k);
-			processedArgs.add(v);
 		};
 
-		if(sawOut.not) {
-			processedArgs.add(\out);
-			processedArgs.add(targetBusIndex);
+		missingSamples = assets.loadSamples(p, { |bufnum, name| this.prLog('#loadSample', [bufnum, name]) });
+		missingSamples.do { |n|
+			this.prLog('#note', ["sample % is not in the file's meta.samples, the user sample map or Klotho's bundled samples; events using it drop the pfield".format(n.quote)]);
 		};
+		sampleMap = assets.sampleMap;
 
-		^processedArgs.asArray
+		if(p.hasControlEnvelopes) { this.prUploadControlBuffer(p) };
+		if(plan.notNil and: { plan.decoder.notNil }
+			and: { (effectiveOutput == \fold) or: { plan.mainWidth <= 2 } }) {
+			this.prUploadGeometry(plan);
+		};
+		this.prSync;
+		isReady = true;
+		onLoad.value(this, true);
+		^true
 	}
 
-	scheduleBatch { |startIdx|
-		var now, endIdx, nextBatchTime, currentEvent, scheduledCount, skippedCount;
-		var eventTime, absTime, relativeTime, nextBatchDelay, firstEventTime, batchStartTime;
-		var currentBatchStart, batchDuration, overlapTime;
-
-		now = SystemClock.seconds;
-		endIdx = startIdx;
-		scheduledCount = 0;
-		skippedCount = 0;
-		firstEventTime = nil;
-		batchStartTime = now;
-
-		this.log("=== BATCH DEBUG: Starting batch at index % ===".format(startIdx));
-		this.log("Current time: %, Start time: %, Piece time: %".format(now, startTime, now - startTime));
-
-		while({
-			(endIdx < events.size) && { endIdx - startIdx < maxEvents }
-		}) {
-			currentEvent = events[endIdx];
-
-			eventTime = currentEvent["start"].asFloat;
-			absTime = startTime + eventTime;
-			relativeTime = absTime - now;
-
-			if(firstEventTime.isNil) { firstEventTime = eventTime };
-
-			if(relativeTime > 0) {
-				this.scheduleEvent(currentEvent);
-				scheduledCount = scheduledCount + 1;
-				lastScheduledTime = eventTime;
-			} {
-				skippedCount = skippedCount + 1;
-			};
-
-			endIdx = endIdx + 1;
-		};
-
-		this.log("Batch complete: processed % events, scheduled %, skipped %".format(
-			endIdx - startIdx, scheduledCount, skippedCount));
-		this.log("Event time range: %s to %s (span: %s)".format(
-			firstEventTime, lastScheduledTime, lastScheduledTime - firstEventTime));
-
-		if(endIdx < events.size) {
-			currentBatchStart = events[startIdx]["start"].asFloat;
-			batchDuration = lastScheduledTime - currentBatchStart;
-			overlapTime = batchDuration * batchOverlapRatio;
-			nextBatchTime = startTime + currentBatchStart + overlapTime;
-			nextBatchDelay = nextBatchTime - now;
-
-			this.log("Next batch timing: batchStart=%, duration=%, overlap=%".format(
-				currentBatchStart, batchDuration, overlapTime));
-			this.log("Next batch delay: %s (at piece time %s)".format(
-				nextBatchDelay, nextBatchTime - startTime));
-
-			if(nextBatchDelay > 0) {
-				nextBatchTask = SystemClock.sched(nextBatchDelay, {
-					this.scheduleBatch(endIdx);
-					nil;
-				});
-				this.log("Next batch scheduled for %s".format(nextBatchDelay));
-			} {
-				this.log("Next batch delay is negative! Scheduling immediately.");
-				this.scheduleBatch(endIdx);
-			};
-		} {
-			this.log("All events processed.");
-		};
-
-		nextEventIndex = endIdx;
+	prUploadControlBuffer { |p|
+		ctrlBufnum = server.bufferAllocator.alloc(1);
+		this.sendMsg('/b_alloc', [ctrlBufnum, p.numFrames, 1]);
+		this.prSync;
+		this.prSetnChunks(ctrlBufnum, p.controlFloats);
 	}
 
-	scheduleEvent { |event|
-		var type, id, eventTime, pfields, groupKey;
-		groupKey = (event["group"] ? defaultName).asSymbol;
+	prUploadGeometry { |spatialPlan|
+		geomBufnum = server.bufferAllocator.alloc(1);
+		this.sendMsg('/b_alloc', [geomBufnum, spatialPlan.mainWidth, 6]);
+		this.prSync;
+		this.prSetnChunks(geomBufnum, spatialPlan.decoder.coefficients);
+	}
 
-		type = event["type"];
-		id = event["id"];
-		eventTime = event["start"].asFloat;
-		pfields = event["pfields"] ?? { Dictionary.new };
-
-		case
-		{ type == "new" } {
-			var synthName = event["synthName"];
-			this.createSynth(id, synthName, eventTime, pfields, groupKey);
-		}
-		{ type == "set" } {
-			this.setNode(id, eventTime, pfields, groupKey);
-		}
-		{ type == "release" }{
-			this.releaseNode(id, eventTime);
-		}
-		{ type == "message" } {
-			this.message("TODO", eventTime);
-		}
-		{
-			this.log("WARNING: Unknown event type: %".format(type));
+	// /b_setn in runs of 200 values, as the browser does.
+	prSetnChunks { |bufnum, floats|
+		var off = 0, n = floats.size;
+		while { off < n } {
+			var end = (off + 200).min(n);
+			var chunk = floats.copyRange(off, end - 1).asArray.collect(_.asFloat);
+			this.sendMsg('/b_setn', [bufnum, off, chunk.size] ++ chunk);
+			off = end;
 		};
 	}
 
-	createSynth { |synthId, synthName, eventTime, pfields, groupName|
-		var absTime = startTime + eventTime;
-		var args = this.processPfields(pfields, groupName);
-		var entry = groupMap[(groupName ? defaultName).asSymbol] ? groupMap[defaultName];
-		var targetGroup = entry[\srcGroup];
-
-		SystemClock.schedAbs(absTime, {
-			if(server.serverRunning) {
-				server.bind {
-					var synth;
-					synth = Synth(synthName, args, targetGroup);
-					nodes.put(synthId, synth);
-					nodeWatcher.register(synth);
-					synth.onFree { nodes.removeAt(synthId) };
-					this.mapControlToNode(synthId, synthId);
-				};
-			};
-			nil;
-		});
-	}
-
-	setNode { |nodeId, eventTime, pfields, groupName|
-		var absTime = startTime + eventTime;
-		var args = List.new;
-
-		// Process pfields without bus routing
-		pfields.keysValuesDo { |key, value|
-			var k = key.asSymbol;
-			var v = value;
-
-			if(value.isString) {
-				if(value.every { |c| "0123456789.-".includes(c) }) {
-					v = value.asFloat;
-				};
-			} {
-				if(value.isNil) { v = 0 };
-			};
-
-			args.add(k);
-			args.add(v);
+	prFreeBuffers {
+		if(ctrlBufnum.notNil) {
+			this.sendMsg('/b_free', [ctrlBufnum]);
+			server.bufferAllocator.free(ctrlBufnum);
+			ctrlBufnum = nil;
 		};
-
-		SystemClock.schedAbs(absTime, {
-			if(server.serverRunning) {
-				server.bind {
-					var node = nodes.at(nodeId);
-					if(node.notNil) { node.set(*args.asArray) };
-				};
-			};
-			nil;
-		});
+		if(geomBufnum.notNil) {
+			this.sendMsg('/b_free', [geomBufnum]);
+			server.bufferAllocator.free(geomBufnum);
+			geomBufnum = nil;
+		};
 	}
 
-	releaseNode { |nodeId, eventTime|
-		var absTime = startTime + eventTime;
-
-		SystemClock.schedAbs(absTime, {
-			if(server.serverRunning) {
-				server.bind {
-					var node = nodes.at(nodeId);
-					if(node.notNil) { node.release(nil) };
-				};
-			};
-			nil;
-		});
-	}
-
-	message { |msg, eventTime|
-		var absTime = startTime + eventTime;
-
-		SystemClock.schedAbs(absTime, {
-			if(server.serverRunning) {
-				server.bind {
-					msg.postln;
-				};
-			};
-			nil;
-		});
-	}
+	// ---- play -----------------------------------------------------------------
 
 	play {
+		var token;
 		if(server.serverRunning.not) {
-			"ERROR: Server not running. Boot the server first.".postln;
-			^false;
-		};
-
-		if(isPlaying) {
-			"Already playing.".postln;
+			this.prError("server not running; boot it first");
 			^false
 		};
-
-		if(events.size <= 0) {
-			"No events loaded.".postln;
+		if(payload.isNil) {
+			this.prError("no file loaded");
 			^false
 		};
-
-		startTime = SystemClock.seconds + startLag;
+		if(isReady.not) {
+			this.prLog('#playRejected', [lastError ? "the loaded file was refused"]);
+			this.prError("playback could not start: " ++ (lastError ? "the loaded file was refused"));
+			^false
+		};
+		stopToken = stopToken + 1;
+		token = stopToken;
+		this.prCancelPlay;
+		playStart = thisThread.seconds + startupDelay;
+		this.prLog('#play', []);
+		nodeMap = Dictionary.new;
+		defNameMap = Dictionary.new;
+		warnedGroups = Set.new;
+		warnedBufs = Set.new;
+		try {
+			mixer.build(payload, effectiveOutput, geomBufnum, stemTaps, enableMonitoring);
+			this.prSetupControlEnvelopes;
+		} { |err|
+			this.prAbortPlaySetup(err);
+			^false
+		};
+		pieceDur = payload.pieceDur;
 		isPlaying = true;
-		nextEventIndex = 0;
-		lastScheduledTime = 0;
-
-		"Starting playback...".postln;
-
-		this.scheduleControlEnvelopes;
-		this.scheduleBatch(0);
-
-		^true;
+		playRoutine = Routine({ this.prRun(token) }).play(SystemClock);
+		^true
 	}
 
+	// scheduler_core.js _abortPlaySetup: free what was built, say why once, run
+	// the end-of-play callbacks so a transport re-arms.
+	prAbortPlaySetup { |err|
+		var msg = err.errorString;
+		isPlaying = false;
+		lastError = msg;
+		this.prFreeLive;
+		this.prError("playback could not start: " ++ msg);
+		this.prLog('#onFinish', []);
+		onFinish.value(this);
+		this.prLog('#onIdle', []);
+		onIdle.value(this);
+	}
+
+	// scheduler_score.js setupControlEnvelopes.
+	prSetupControlEnvelopes {
+		var p = payload, floats, blockSize;
+		controlBusMap = [];
+		if(p.hasControlEnvelopes.not or: { ctrlBufnum.isNil }) { ^this };
+		floats = p.controlFloats;
+		blockSize = p.blockSize;
+		controlGroup = this.nextNodeID;
+		this.sendMsg('/g_new', [controlGroup, 0, mixer.scoreGroup]);
+		p.descriptors.do { |desc|
+			var bus = Bus.control(server, 1), startFrame = desc.blockIndex * blockSize, firstValue, params;
+			controlBuses.add(bus);
+			firstValue = if(startFrame < floats.size) { floats[startFrame] } { 0.0 };
+			this.sendMsg('/c_set', [bus.index, firstValue]);
+			params = desc.pfields.reject(_.isNil);
+			if(params.size == 0) { params = ["amp"] };
+			controlBusMap = controlBusMap.add((
+				bus: bus.index, params: params, targets: desc.targets,
+				start: desc.start, dur: desc.dur, bufnum: ctrlBufnum,
+				startFrame: startFrame, numFrames: blockSize, groupId: controlGroup
+			));
+		};
+	}
+
+	prFreeControlBuses {
+		controlBuses.do { |b| b.free };
+		controlBuses = List.new;
+		controlBusMap = [];
+		controlGroup = nil;
+	}
+
+	// scheduler_core.js _buildSendPlan: events plus control items, stable-sorted
+	// by start, events before control items at an equal start.
+	prBuildSendPlan {
+		var items = payload.events.collect { |ev| (kind: \event, start: ev.start, ev: ev) };
+		var ctrl = controlBusMap.collect { |cm| (kind: \ctrl, start: cm.start, cm: cm) };
+		var merged;
+		if(ctrl.size == 0) { ^items };
+		merged = items ++ ctrl;
+		merged.do { |it, i| it[\seq] = i };
+		^merged.sort { |a, b| (a.start < b.start) or: { (a.start == b.start) and: { a.seq < b.seq } } }
+	}
+
+	prLoopState {
+		var finite = 0;
+		if(loop.isKindOf(Number) and: { loop > 1 }) { finite = loop.floor.asInteger };
+		if(loop == true or: { finite > 0 }) {
+			^(cycleIndex: 0, finite: finite)
+		};
+		^nil
+	}
+
+	prRun { |token|
+		var loopState = this.prLoopState, cycle = 0, relOffset = 0.0, cycleDur, finishAt;
+		var sendPlan = this.prBuildSendPlan, running = true;
+		cycleDur = pieceDur + tailPause;
+		while { running } {
+			var buckets = this.prBuckets(sendPlan, cycle, relOffset, loopState.notNil);
+			buckets.do { |b|
+				var tt = playStart + b.time, delta;
+				delta = (tt - latency) - thisThread.seconds;
+				if(delta > 0) { delta.wait };
+				if(token != stopToken) { ^nil };
+				this.prSendTimed(tt, b.msgs);
+			};
+			if(loopState.isNil) {
+				running = false;
+			} {
+				cycle = cycle + 1;
+				if(loopState.finite > 0 and: { cycle >= loopState.finite }) {
+					running = false;
+				} {
+					relOffset = relOffset + cycleDur;
+				};
+			};
+		};
+		finishAt = playStart + relOffset + pieceDur + tailPause;
+		((finishAt - thisThread.seconds).max(0)).wait;
+		if(token != stopToken) { ^nil };
+		this.prFinishPlayback(token);
+	}
+
+	// One cycle's messages, grouped by time tag, in plan order. Carried items
+	// (auto-releases, deferred maps) land in their own instant ahead of the
+	// events that start there, which is the browser's send order too.
+	prBuckets { |sendPlan, cycle, relOffset, looping|
+		var buckets = Dictionary.new, idPrefix = if(looping) { "c" ++ cycle ++ ":" } { nil };
+		var add = { |t, msg|
+			var key = (t * 1e9).round / 1e9, b = buckets[key];
+			if(b.isNil) { b = (time: t, msgs: List.new); buckets[key] = b };
+			b.msgs.add(msg);
+		};
+		sendPlan.do { |item|
+			var t = relOffset + item.start, cm, nid, ev, evId;
+			if(item.kind == \ctrl) {
+				cm = item.cm;
+				nid = this.nextNodeID;
+				add.value(t, ['/s_new', '__klEnvCtrl', nid, 0, cm.groupId,
+					'bufnum', cm.bufnum, 'bus', cm.bus, 'dur', cm.dur,
+					'startFrame', cm.startFrame, 'numFrames', cm.numFrames]);
+				cm[\nodeId] = nid;
+			} {
+				ev = item.ev;
+				evId = if(idPrefix.notNil) { idPrefix ++ ev.id } { ev.id };
+				switch(ev.type,
+					"new", { this.prBundleNew(ev, evId, t, relOffset, add) },
+					"set", { this.prBundleSet(ev, evId, t, relOffset, add) },
+					"release", { this.prBundleRelease(ev, evId, t, add) }
+				);
+				if(ev.type == "new" and: { ev.stepIndex.notNil } and: { onEvent.notNil }) {
+					this.prScheduleOnEvent(playStart + t, ev.stepIndex);
+				};
+			};
+		};
+		^buckets.values.asArray.sort { |a, b| a.time < b.time }
+	}
+
+	prScheduleOnEvent { |absTime, stepIndex|
+		var token = stopToken;
+		SystemClock.schedAbs(absTime, {
+			if(token == stopToken) { onEvent.value(stepIndex, this) };
+			nil
+		});
+	}
+
+	// scheduler_core.js _resolveDefPfields: null, objects and arrays are
+	// dropped; a string is a sample name on a buf* key (mapped to its bufnum)
+	// and dropped anywhere else. Returns a List of [key, value] pairs.
+	prResolvePfields { |pfields|
+		var out = List.new;
+		pfields.keysValuesDo { |key, val|
+			var mapped;
+			if(val.notNil and: { val.isKindOf(Dictionary).not } and: { val.isKindOf(Array).not }) {
+				if(val.isString) {
+					if(key.beginsWith("buf")) {
+						mapped = sampleMap[val];
+						if(mapped.notNil) {
+							out.add([key, mapped]);
+						} {
+							if(warnedBufs.includes(val).not) {
+								warnedBufs.add(val);
+								this.warn("[Klotho] sample % is not loaded; events using it will be silent or play the wrong buffer.".format(val.quote));
+							};
+						};
+					};
+				} {
+					out.add([key, val]);
+				};
+			};
+		};
+		^out
+	}
+
+	prSetPair { |pairs, key, value|
+		pairs.do { |p| if(p[0] == key) { p[1] = value; ^pairs } };
+		pairs.add([key, value]);
+		^pairs
+	}
+
+	prFlatten { |pairs|
+		var out = Array.new(pairs.size * 2);
+		pairs.do { |p| out = out.add(p[0].asSymbol).add(p[1]) };
+		^out
+	}
+
+	// Track lookup with the browser's fallback: "default" is main; an unknown
+	// name plays on main with one warning per name per play.
+	prTrackInfo { |group|
+		var g = group ? "default", info;
+		if(mixer.trackMap.isNil) { ^nil };
+		info = mixer.trackMap[g];
+		if(info.isNil) {
+			if(warnedGroups.includes(g).not) {
+				warnedGroups.add(g);
+				this.warn("[Klotho] no track named '%'; its events play on the main chain. Known tracks: %".format(
+					g, (mixer.trackOrder ++ ["main", "default"]).join(", ")));
+			};
+			info = mixer.trackMap["default"];
+		};
+		^info
+	}
+
+	prBundleNew { |ev, evId, t, relOffset, add|
+		var defName, nid, pairs, target, info, args, mappings;
+		if(ev.defName == "__rest__") { ^this };
+		defName = KSPayload.resolveDefName(ev.defName);
+		nid = this.nextNodeID;
+		pairs = this.prResolvePfields(ev.pfields);
+		if(mixer.trackMap.notNil) {
+			info = this.prTrackInfo(ev[\group]);
+			target = if(info.notNil) { info.srcGroup } { mixer.scoreGroup };
+			if(info.notNil) { this.prSetPair(pairs, "out", info.srcBus.index + (ev.speakerLane ? 0)) };
+		} {
+			target = mixer.scoreGroup;
+		};
+		args = ['/s_new', defName, nid, 0, target] ++ this.prFlatten(pairs);
+		add.value(t, args);
+		nodeMap[evId] = nid;
+		defNameMap[evId] = defName;
+		this.prMaybeAutoRelease(ev, nid, defName, t, add);
+		mappings = this.prControlMappings(ev.id, ev.start);
+		mappings.do { |mp|
+			var mapT = if(mp.deferred) { relOffset + mp.startTime } { t };
+			add.value(mapT, ['/n_map', nid, mp.param, mp.bus]);
+		};
+	}
+
+	prBundleSet { |ev, evId, t, relOffset, add|
+		var nid = nodeMap[evId] ?? { nodeMap[ev.id] }, defName, pairs, info, args, mappings;
+		if(nid.isNil) { ^this };
+		defName = defNameMap[evId] ?? { defNameMap[ev.id] };
+		pairs = this.prResolvePfields(ev.pfields);
+		if(mixer.trackMap.notNil) {
+			info = this.prTrackInfo(ev[\group]);
+			if(info.notNil) { this.prSetPair(pairs, "out", info.srcBus.index + (ev.speakerLane ? 0)) };
+		};
+		args = ['/n_set', nid] ++ this.prFlatten(pairs);
+		add.value(t, args);
+		this.prMaybeAutoRelease(ev, nid, defName, t, add);
+		mappings = this.prControlMappings(ev.id, ev.start);
+		mappings.do { |mp|
+			if((mp.startTime - ev.start).abs <= 1e-6) {
+				add.value(t, ['/n_map', nid, mp.param, mp.bus]);
+			};
+		};
+	}
+
+	prBundleRelease { |ev, evId, t, add|
+		var nid = nodeMap[evId] ?? { nodeMap[ev.id] }, defName;
+		if(nid.isNil) { ^this };
+		defName = defNameMap[evId] ?? { defNameMap[ev.id] };
+		if(assets.isGated(defName, payload.metaDefs).not) { ^this };
+		add.value(t, ['/n_set', nid, 'gate', 0]);
+	}
+
+	// scheduler_core.js _maybeScheduleAutoRelease.
+	prMaybeAutoRelease { |ev, nid, defName, t, add|
+		if(ev.releaseAfter.not) { ^this };
+		if(ev.dur.isNil or: { (ev.dur > 0).not }) { ^this };
+		if(assets.isGated(defName, payload.metaDefs).not) { ^this };
+		add.value(t + ev.dur, ['/n_set', nid, 'gate', 0]);
+	}
+
+	// scheduler_score.js _getControlMappingsForEvent: one mapping per declared
+	// pfield of every descriptor that targets this event id.
+	prControlMappings { |evId, evStart|
+		var mappings = List.new;
+		controlBusMap.do { |cm|
+			var tgt = cm.targets.detect { |tg| tg.id == evId };
+			if(tgt.notNil) {
+				var deferred = evStart.notNil and: { tgt.startTime > (evStart + 1e-9) };
+				cm.params.do { |param|
+					mappings.add((param: param, bus: cm.bus, startTime: tgt.startTime, deferred: deferred));
+				};
+			};
+		};
+		^mappings
+	}
+
+	// One instant: as few bundles as the byte budget allows, every message
+	// time-tagged at exactly `tt`, logged in send order.
+	prSendTimed { |tt, msgs|
+		var bundles = List.new, cur = List.new, curSize = 16, late, sent, flags;
+		msgs.do { |m|
+			var sz = m.msgSize + 4;
+			if(cur.size > 0 and: { (curSize + sz) > maxBundleBytes }) {
+				bundles.add(cur);
+				cur = List.new;
+				curSize = 16;
+			};
+			cur.add(m);
+			curSize = curSize + sz;
+		};
+		if(cur.size > 0) { bundles.add(cur) };
+		bundles.do { |b| server.sendBundle(tt - thisThread.seconds, *b.asArray) };
+		late = Main.elapsedTime > tt;
+		sent = thisThread.seconds - playStart;
+		flags = if(late) { (late: true) } { nil };
+		msgs.do { |m| this.prTap(tt - playStart, m[0], m.copyRange(1, m.size - 1), sent, flags) };
+		if(lastSentTag.isNil or: { tt > lastSentTag }) { lastSentTag = tt };
+	}
+
+	// ---- finish, ring-out, stop ---------------------------------------------------
+
+	prFinishPlayback { |token|
+		var entry;
+		isPlaying = false;
+		this.prLog('#onFinish', []);
+		onFinish.value(this);
+		entry = mixer.detach;
+		entry[\controlBuses] = controlBuses;
+		controlBuses = List.new;
+		controlBusMap = [];
+		controlGroup = nil;
+		deferredRings.add(entry);
+		ringTime.wait;
+		if(token != stopToken) { ^nil };
+		this.prFreeRing(entry);
+		0.25.wait;
+		if(token != stopToken) { ^nil };
+		this.prSync;
+		if(token != stopToken) { ^nil };
+		playRoutine = nil;
+		this.prLog('#onIdle', []);
+		onIdle.value(this);
+	}
+
+	prFreeRing { |entry|
+		KSMixer.freeEntry(this, entry);
+		(entry[\controlBuses] ? []).do { |b| b.free };
+		deferredRings.remove(entry);
+	}
+
+	prCancelAllDeferredRings {
+		deferredRings.copy.do { |entry| this.prFreeRing(entry) };
+		deferredRings = List.new;
+	}
+
+	prFreeLive {
+		if(mixer.isBuilt) { mixer.freeNow };
+		this.prFreeControlBuses;
+	}
+
+	prStopRecorders {
+		recorders.do { |r| r.stop };
+		recorders = List.new;
+		if(recordRoutine.notNil) { recordRoutine.stop; recordRoutine = nil };
+		isRecording = false;
+	}
+
+	// The teardown a new play runs first (scheduler_core.js play's restart
+	// section): the old routine stops, ringing groups are freed now.
+	prCancelPlay {
+		if(playRoutine.notNil) { playRoutine.stop; playRoutine = nil };
+		this.prCancelAllDeferredRings;
+		this.prFreeLive;
+		isPlaying = false;
+	}
+
+	// Stop now. Frees this play's score group and nothing else; bundles already
+	// queued in scsynth for later instants address freed nodes and do nothing.
+	// No callback fires.
 	stop {
-		if(isPlaying.not) {
-			"Not playing.".postln;
+		var purged = 0, now;
+		stopToken = stopToken + 1;
+		isPlaying = false;
+		if(playRoutine.notNil) { playRoutine.stop; playRoutine = nil };
+		this.prLog('#stop', []);
+		this.prStopRecorders;
+		this.prCancelAllDeferredRings;
+		this.prFreeLive;
+		if(playStart.notNil and: { oscTap.isKindOf(KSTrace) }) {
+			now = thisThread.seconds - playStart;
+			purged = oscTap.markPurgedAfter(now);
+		};
+		this.prLog('#purge', [purged]);
+		nodeMap = Dictionary.new;
+		defNameMap = Dictionary.new;
+		if(server.serverRunning) { { server.sync }.fork };
+		^true
+	}
+
+	prTeardownAll {
+		stopToken = stopToken + 1;
+		isPlaying = false;
+		if(playRoutine.notNil) { playRoutine.stop; playRoutine = nil };
+		this.prStopRecorders;
+		this.prCancelAllDeferredRings;
+		this.prFreeLive;
+		this.prFreeBuffers;
+		assets.freeSamples;
+		sampleMap = Dictionary.new;
+		nodeMap = Dictionary.new;
+		defNameMap = Dictionary.new;
+	}
+
+	// Release everything this player holds on the server.
+	free {
+		this.prTeardownAll;
+		payload = nil;
+		isReady = false;
+	}
+
+	// ---- recording --------------------------------------------------------------
+
+	// Record one pass of the loaded file: the main output (N channels in
+	// \array mode, 2 in \fold) to `path`, plus one file per track when `stems`
+	// is true (<base>_<track>.<ext>, each at the track's width). Never writes
+	// the control-envelope .wav.
+	record { |path, stems = false, onComplete|
+		var dir, base, ext;
+		if(payload.isNil or: { isReady.not }) {
+			this.prError("record: no file loaded");
 			^false
 		};
-		"Playback stopped".postln;
-		//
-		// if(nextBatchTask.notNil) {
-		// 	nextBatchTask.stop;
-		// 	nextBatchTask = nil;
-		// };
-		//
-		// server.freeAll;
-		// nodes.clear;
-		Routine({
-			CmdPeriod.run;
-			server.sync;
-			isPlaying = false;
-			if(loadedFilePath.notNil) {
-				this.loadFile(loadedFilePath);  // Reload
-				"File reloaded and ready for playback".postln;
+		path = path.standardizePath;
+		if(payload.wavPath.notNil and: { path == payload.wavPath.standardizePath }) {
+			this.prError("record: % is the control-envelope buffer of the loaded file; choose another path".format(path));
+			^false
+		};
+		if(isPlaying or: { isRecording }) { this.stop };
+		dir = path.dirname;
+		base = PathName(path).fileNameWithoutExtension;
+		ext = PathName(path).extension;
+		if(ext.isNil or: { ext.size == 0 }) { ext = "wav" };
+		recordRoutine = Routine({
+			var recs = List.new, mix, numCh, savedLoop, stopAt, mw, token;
+			mw = KSMixer.computeMainWidth(payload);
+			numCh = if(effectiveOutput == \array) { mw } { 2 };
+			savedLoop = loop;
+			loop = false;
+			isRecording = true;
+			mix = KSDiskRecorder(server, dir +/+ (base ++ "." ++ ext), numCh, 0, 0, \addToTail);
+			mix.prepare(assets);
+			recs.add(mix);
+			recorders = recs;
+			if(this.play.not) {
+				this.prStopRecorders;
+				loop = savedLoop;
+				^nil
 			};
-		}).play;
-
-		^true;
+			token = stopToken;
+			if(stems and: { mixer.trackMap.notNil }) {
+				(mixer.trackOrder ++ ["main"]).do { |nm|
+					var t = mixer.trackInfo(nm), r;
+					r = KSDiskRecorder(server, dir +/+ (base ++ "_" ++ nm ++ "." ++ ext), t.width, t.fxBus.index, 0, \addToTail);
+					r.prepare(assets);
+					recs.add(r);
+				};
+			};
+			if(token != stopToken) { ^nil };
+			recs.do { |r| this.prSendTimed(playStart, [r.startMessage(this.nextNodeID)]) };
+			stopAt = playStart + pieceDur + tailPause + ringTime + 0.1;
+			((stopAt - thisThread.seconds).max(0)).wait;
+			if(token != stopToken) { ^nil };
+			recs.do { |r| r.stop };
+			recorders = List.new;
+			isRecording = false;
+			recordRoutine = nil;
+			loop = savedLoop;
+			onComplete.value(this);
+			recordingCompleteCallback.value(this);
+		}).play(SystemClock);
+		^true
 	}
 
-	hasNode { |nodeId|
-		^nodes.includesKey(nodeId);
+	// ---- introspection and GUI hooks --------------------------------------------
+
+	trackNames {
+		if(payload.isNil) { ^[] };
+		^payload.trackNames ++ ["main"]
+	}
+
+	insertNames { |track|
+		var specs;
+		if(payload.isNil) { ^[] };
+		specs = payload.insertSpecs(track);
+		if(specs.isNil) { ^[] };
+		^specs.collect { |s| s.defName }
+	}
+
+	setTrackGain { |track, amp|
+		mixer.gains[track.asString] = amp;
+		mixer.applyGain(track.asString);
+	}
+
+	muteTrack { |track, flag = true|
+		if(flag) { mixer.mutes.add(track.asString) } { mixer.mutes.remove(track.asString) };
+		mixer.applyAllGains;
+	}
+
+	soloTrack { |track, flag = true|
+		if(flag) { mixer.solos.add(track.asString) } { mixer.solos.remove(track.asString) };
+		mixer.applyAllGains;
+	}
+
+	hasNode { |id|
+		^nodeMap.includesKey(id.asString)
+	}
+
+	nodeID { |id|
+		^nodeMap[id.asString]
 	}
 
 	status {
-		"EventScheduler Status".postln;
-		"  Playing: %".format(isPlaying).postln;
-		"  Events: %".format(events.size).postln;
-		"  Active nodes: %".format(nodes.size).postln;
-		"  Registered buses: %".format(buses.size).postln;
-	}
-
-	record { |path, stems=true, end_padding=5.0|
-		var pn = PathName(path);
-		var dir = pn.pathOnly;
-		var base = pn.fileNameWithoutExtension;
-		var ext  = pn.extension ? "wav";
-		var pieceDur;
-
-		pieceDur = if(events.size > 0) {
-			events.collect({ |e| e["start"].asFloat }).maxItem
-		} { 0.0 };
-
-		Routine({
-			var tStart, tStop;
-			var recs, bufMap, diskNodes, ch, frames;
-
-			if(stems.not) {
-				server.prepareForRecord(dir +/+ (base ++ "." ++ ext), 2);
-				server.sync;
-
-				this.play;
-
-				tStart = startTime;
-				tStop  = tStart + pieceDur + end_padding;
-
-				SystemClock.schedAbs(tStart, { server.record; nil });
-				// SystemClock.schedAbs(tStop,  { server.stopRecording; this.stop; nil });
-				SystemClock.schedAbs(tStop,  {
-					server.stopRecording;
-					this.stop;
-					if(recordingCompleteCallback.notNil) {
-						AppClock.sched(0, { recordingCompleteCallback.value; nil });
-					};
-					nil
-				});
-			} {
-				bufMap = IdentityDictionary.new;
-				ch = 2;
-				frames = 131072;
-
-				groupMap.keysValuesDo { |nm, entry|
-					var stemPath = dir +/+ (base ++ "_" ++ nm.asString ++ "." ++ ext);
-					var buf = Buffer.alloc(server, frames, ch);
-					server.sync;
-
-					buf.write(
-						path: stemPath,
-						headerFormat: ext.asString,
-						sampleFormat: "int24",
-						numFrames: 0,
-						startFrame: 0,
-						leaveOpen: true
-					);
-					server.sync;
-
-					bufMap[nm] = buf;
-				};
-
-				this.play;
-
-				tStart = startTime;
-				tStop  = tStart + pieceDur + end_padding;
-
-				diskNodes = IdentityDictionary.new;
-				SystemClock.schedAbs(tStart, {
-					server.bind {
-						groupMap.keysValuesDo { |nm, entry|
-							var buf, inbus, node, busRouter;
-							buf = bufMap[nm];
-							inbus = entry[\fxBus].index;
-							busRouter = busSynths[nm];
-							node = Synth.after(busRouter, \__kl_diskout, [
-								\bufnum, buf.bufnum,
-								\inbus,  inbus
-							]);
-							diskNodes[nm] = node;
-						};
-					};
-					nil
-				});
-
-				SystemClock.schedAbs(tStop, {
-					diskNodes.keysValuesDo { |k, n| n.free };
-					// AppClock.sched(0.1, {
-					// 	bufMap.keysValuesDo { |k, b| b.close; b.free };
-					// 	// isPlaying = false;
-					// 	this.stop;
-					// 	nil
-					// });
-					AppClock.sched(0.1, {
-						bufMap.keysValuesDo { |k, b| b.close; b.free };
-						this.stop;
-						if(recordingCompleteCallback.notNil) {
-							recordingCompleteCallback.value;
-						};
-						nil
-					});
-					nil
-				});
-			};
-		}).play(AppClock);
-
-		^true
+		"EventScheduler status".postln;
+		"  file: %".format(loadedFilePath).postln;
+		"  ready: %  playing: %  recording: %".format(isReady, isPlaying, isRecording).postln;
+		if(payload.notNil) {
+			"  events: %  pieceDur: %  tracks: %".format(payload.events.size, payload.pieceDur, this.trackNames).postln;
+			"  output: %  loop: %  ringTime: %".format(effectiveOutput, loop, ringTime).postln;
+		};
 	}
 }

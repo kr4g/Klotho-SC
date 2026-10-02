@@ -1,37 +1,32 @@
-EventSchedulerGUI {
-	var <scheduler;
-	var <window;
-	var <fileMenu, <fileNameLabel;
-	var <playButton, <recordButton, <stemsCheckbox;
-	var <trackContainer;
-	var <trackViews;
-	var <levelUpdateTask;
-	var <groupOrder;
-	var <currentFilePath;
-	var <server;
+// EventSchedulerGUI: a transport and mixer window for EventScheduler.
+//
+// Load, play/stop, loop, array/fold output, record (with stems), one strip per
+// track (main last) with mute, solo, a fader on the track's router gain, a
+// level meter and the insert chain in order. The strips come from the loaded
+// file; the fader gains persist across plays and apply to the live routers.
 
+EventSchedulerGUI {
+	var <scheduler, <server;
+	var <window;
+	var <fileNameLabel, <statusLabel;
+	var <loadButton, <playButton, <recordButton, <stemsCheckbox, <loopMenu, <outputMenu;
+	var <trackContainer, <trackViews, <levelUpdateTask, <trackOrder;
+	var <currentFilePath;
 	var <dbHead;
 
 	*new { |server|
 		^super.new.init(server)
 	}
 
-	init { |serverArg, maxEvents=500, batchOverlapRatio=0.8, startLag=0.5, debug=false|
+	init { |serverArg|
 		server = serverArg ? Server.default;
-		scheduler = EventScheduler.new(
-			server: server,
-			maxEvents: maxEvents,
-			batchOverlapRatio: batchOverlapRatio,
-			startLag: startLag,
-			enableMonitoring: true,
-		);
+		scheduler = EventScheduler.new(server: server, enableMonitoring: true);
+		scheduler.onFinish = { this.onSchedulerFinish };
+		scheduler.onIdle = { this.onSchedulerIdle };
 		trackViews = List.new;
-		groupOrder = List.new;
-
+		trackOrder = List.new;
 		dbHead = 6;
-
 		this.createWindow;
-		this.createFileMenu;
 		this.createTransportControls;
 		this.createTrackSection;
 		this.layoutWindow;
@@ -47,32 +42,18 @@ EventSchedulerGUI {
 		.align_(\center)
 		.background_(Color.gray(0.95))
 		.font_(Font.default.size_(14));
-	}
 
-	createFileMenu {
-		var menuItems = ["Select Action...", "Load File...", "Recent Files", "New Session"];
-		fileMenu = PopUpMenu()
-		.items_(menuItems)
-		.value_(0)
-		.action_({ |menu|
-			switch(menu.value,
-				1, {
-					this.loadFileDialog;
-					AppClock.sched(0.1, { menu.value_(0); nil });
-				},
-				2, {
-					this.showRecentFiles;
-					AppClock.sched(0.1, { menu.value_(0); nil });
-				},
-				3, {
-					this.newSession;
-					AppClock.sched(0.1, { menu.value_(0); nil });
-				}
-			)
-		});
+		statusLabel = StaticText()
+		.string_("")
+		.align_(\left)
+		.font_(Font.default.size_(11));
 	}
 
 	createTransportControls {
+		loadButton = Button()
+		.states_([["Load..."]])
+		.action_({ this.loadFileDialog });
+
 		playButton = Button()
 		.states_([
 			["▶", Color.black, Color.green(0.8)],
@@ -80,11 +61,7 @@ EventSchedulerGUI {
 		])
 		.font_(Font.default.size_(16))
 		.action_({ |btn|
-			if(btn.value == 1) {
-				this.play;
-			} {
-				this.stop;
-			}
+			if(btn.value == 1) { this.play } { this.stop };
 		});
 
 		recordButton = Button()
@@ -94,68 +71,74 @@ EventSchedulerGUI {
 		])
 		.font_(Font.default.size_(16))
 		.action_({ |btn|
-			if(btn.value == 1) {
-				this.startRecording;
-			} {
-				this.stopRecording;
-			}
+			if(btn.value == 1) { this.startRecording } { this.stopRecording };
 		});
 
-		stemsCheckbox = CheckBox()
-		.value_(true);
+		stemsCheckbox = CheckBox().value_(false);
+
+		loopMenu = PopUpMenu()
+		.items_(["Loop: off", "Loop: ∞", "Loop ×2", "Loop ×4", "Loop ×8"])
+		.value_(0)
+		.action_({ |menu|
+			scheduler.loop = [false, true, 2, 4, 8][menu.value];
+		});
+
+		outputMenu = PopUpMenu()
+		.items_(["Output: auto", "Output: array", "Output: fold"])
+		.value_(0)
+		.action_({ |menu|
+			this.setStatus("output: " ++ menu.items[menu.value]);
+			scheduler.output = [nil, \array, \fold][menu.value];
+		});
 	}
 
 	createTrackSection {
 		trackContainer = ScrollView()
-		.hasHorizontalScroller_(false)
+		.hasHorizontalScroller_(true)
 		.hasVerticalScroller_(true);
 	}
 
+	layoutWindow {
+		var transportLayout = HLayout(
+			loadButton.fixedWidth_(80),
+			nil,
+			playButton.fixedWidth_(60),
+			recordButton.fixedWidth_(60),
+			stemsCheckbox,
+			StaticText().string_("Stems").fixedWidth_(40),
+			loopMenu.fixedWidth_(110),
+			outputMenu.fixedWidth_(130),
+			nil
+		);
+		window.layout = VLayout(
+			fileNameLabel.fixedHeight_(25),
+			transportLayout,
+			trackContainer,
+			statusLabel.fixedHeight_(18)
+		);
+		this.relayoutTracks;
+	}
+
+	setStatus { |text|
+		defer { if(window.notNil and: { window.isClosed.not }) { statusLabel.string = text } };
+	}
+
+	// ---- tracks ----------------------------------------------------------------
+
 	updateTracks {
-		var trackNames;
-
 		this.stopLevelMonitoring;
-
 		trackViews.clear;
-		groupOrder.clear;
-
-		if(trackContainer.canvas.notNil) {
-			trackContainer.canvas.remove;
-		};
-
-		if(scheduler.groupMap.notNil) {
-			// Use the scheduler's groupOrder directly
-			if(scheduler.groupOrder.notNil and: { scheduler.groupOrder.size > 0 }) {
-				groupOrder = scheduler.groupOrder.copy;
-			} {
-				// Fallback if groupOrder isn't set
-				groupOrder = scheduler.groupMap.keys.asArray;
-			};
-
-			// Ensure main is always last
-			if(groupOrder.includes(\main)) {
-				groupOrder.remove(\main);
-			};
-			groupOrder = groupOrder.add(\main);
-
-			trackNames = groupOrder;
-		} {
-			trackNames = [];
-		};
-
-		trackNames.do { |trackName|
-			if(scheduler.groupMap.includesKey(trackName)) {
-				this.createTrackView(trackName);
-			};
-		};
-
+		trackOrder.clear;
+		if(trackContainer.canvas.notNil) { trackContainer.canvas.remove };
+		scheduler.trackNames.do { |name| trackOrder.add(name) };
+		trackOrder.do { |name| this.createTrackView(name) };
 		this.relayoutTracks;
 	}
 
 	createTrackView { |trackName|
 		var trackView, nameLabel, gainSlider, muteButton, soloButton;
-		var insertContainer, insertLabel, meterView, gainContainer;
-		var dbLabel;
+		var insertContainer, insertLabel, meterView, gainContainer, dbLabel;
+		var gain = scheduler.mixer.gains[trackName] ? 1.0;
 
 		trackView = CompositeView()
 		.background_(Color.gray(0.9))
@@ -169,24 +152,20 @@ EventSchedulerGUI {
 
 			HLayout(
 				muteButton = Button()
-				.states_([
-					["M", Color.black, Color.white],
-					["M", Color.white, Color.red]
-				])
+				.states_([["M", Color.black, Color.white], ["M", Color.white, Color.red]])
 				.fixedSize_(Size(25, 25))
-				.action_({ |btn| this.muteTrack(trackName, btn.value == 1) }),
+				.value_(scheduler.mixer.mutes.includes(trackName).binaryValue)
+				.action_({ |btn| scheduler.muteTrack(trackName, btn.value == 1) }),
 
 				soloButton = Button()
-				.states_([
-					["S", Color.black, Color.white],
-					["S", Color.white, Color.yellow]
-				])
+				.states_([["S", Color.black, Color.white], ["S", Color.white, Color.yellow]])
 				.fixedSize_(Size(25, 25))
-				.action_({ |btn| this.soloTrack(trackName, btn.value == 1) })
+				.value_(scheduler.mixer.solos.includes(trackName).binaryValue)
+				.action_({ |btn| scheduler.soloTrack(trackName, btn.value == 1) })
 			).margins_(2),
 
 			dbLabel = StaticText()
-			.string_("0 dB")
+			.string_("% dB".format(gain.ampdb.round(0.1)))
 			.align_(\center)
 			.font_(Font.default.size_(10))
 			.fixedHeight_(20),
@@ -206,18 +185,16 @@ EventSchedulerGUI {
 
 				gainSlider = Slider()
 				.orientation_(\vertical)
-				.value_(this.ampToSlider(1.0))
+				.value_(this.ampToSlider(gain))
 				.background_(Color.clear)
 				.fixedWidth_(20)
 				.action_({ |slider|
 					var db = this.sliderToDb(slider.value);
-					var amp = db.dbamp;
-					this.setTrackGain(trackName, amp);
+					scheduler.setTrackGain(trackName, db.dbamp);
 					dbLabel.string = "% dB".format(db.round(0.1));
 				}),
 
 				StaticText()
-				// .string_("0\n\n-20\n\n-40\n\n-60\n\n-∞")
 				.string_("+%\n\n0\n\n-20\n\n-40\n\n-60".format(dbHead))
 				.align_(\left)
 				.font_(Font.default.size_(9))
@@ -235,89 +212,26 @@ EventSchedulerGUI {
 			.minHeight_(100)
 		).margins_(2).spacing_(2));
 
-		this.createInserts(insertContainer, trackName);
+		scheduler.insertNames(trackName).do { |name|
+			insertContainer.layout.add(
+				StaticText().string_(name.asString).align_(\center).background_(Color.gray(0.6)).fixedHeight_(20)
+			);
+		};
 
 		trackViews.add((
-			name: trackName,
-			view: trackView,
-			gainSlider: gainSlider,
-			meterView: meterView,
-			muteButton: muteButton,
-			soloButton: soloButton,
-			insertContainer: insertContainer,
-			dbLabel: dbLabel
+			name: trackName, view: trackView, gainSlider: gainSlider, meterView: meterView,
+			muteButton: muteButton, soloButton: soloButton, insertContainer: insertContainer, dbLabel: dbLabel
 		));
 	}
 
-	createInserts { |container, trackName|
-		var groupEntry, fxNodes;
-
-		if(scheduler.groupMap.notNil) {
-			groupEntry = scheduler.groupMap[trackName];
-			if(groupEntry.notNil) {
-				fxNodes = groupEntry[\fxNodes];
-				if(fxNodes.notNil) {
-					fxNodes.keysValuesDo { |uid, synth|
-						if(uid != \__bypass and: { synth.notNil }) {
-							var synthName = synth.defName;
-							if(synthName.notNil) {
-								this.createInsertView(container, synthName.asString);
-							};
-						};
-					};
-				};
-			};
-		};
-	}
-
-	createInsertView { |container, insertName|
-		var insertView;
-
-		insertView = StaticText()
-		.string_(insertName)
-		.align_(\center)
-		.background_(Color.gray(0.6))
-		.fixedHeight_(20);
-
-		container.layout.add(insertView);
-	}
-
-	layoutWindow {
-		var transportLayout;
-
-		transportLayout = HLayout(
-			StaticText().string_("File:").fixedWidth_(40),
-			fileMenu.maxWidth_(200),
-			nil,
-			HLayout(
-				playButton.fixedWidth_(60),
-				recordButton.fixedWidth_(60),
-				stemsCheckbox,
-				StaticText().string_("Stems").fixedWidth_(40)
-			),
-			nil
-		);
-
-		window.layout = VLayout(
-			fileNameLabel.fixedHeight_(25),
-			transportLayout,
-			trackContainer
-		);
-
-		this.relayoutTracks;
-	}
-
 	relayoutTracks {
-		var tracksLayout;
-
-		tracksLayout = HLayout();
-		trackViews.do { |trackData|
-			tracksLayout.add(trackData.view);
-		};
+		var tracksLayout = HLayout();
+		trackViews.do { |trackData| tracksLayout.add(trackData.view) };
 		tracksLayout.add(nil);
-
 		trackContainer.canvas = View().layout_(tracksLayout);
 	}
+
+	// ---- file ------------------------------------------------------------------
 
 	loadFileDialog {
 		FileDialog({ |paths|
@@ -326,57 +240,47 @@ EventSchedulerGUI {
 		}, {}, 0, 0);
 	}
 
-	showRecentFiles {
-		"Recent files menu".postln;
-	}
-
-	newSession {
-		"New session".postln;
-	}
-
 	loadFile { |path|
-		var pathName;
-
 		this.resetGUI;
 		currentFilePath = path;
-
-		Routine({
-			if(scheduler.loadFile(path)) {
-				pathName = PathName(path);
-				0.2.wait;
-
-				AppClock.sched(0, {
-					fileNameLabel.string_(pathName.fileNameWithoutExtension);
-					("Loaded file: " ++ path).postln;
+		fileNameLabel.string_("Loading...");
+		scheduler.loadFile(path, { |ok|
+			defer {
+				if(window.isNil or: { window.isClosed }) { ^nil };
+				if(ok) {
+					fileNameLabel.string_(PathName(path).fileNameWithoutExtension);
+					this.setStatus("loaded % events, % s, output %".format(
+						scheduler.payload.events.size, scheduler.pieceDur ? scheduler.payload.pieceDur, scheduler.effectiveOutput));
 					this.updateTracks;
 					this.startLevelMonitoring;
-				});
-			} {
-				AppClock.sched(0, {
+				} {
 					fileNameLabel.string_("Load failed");
+					this.setStatus(scheduler.lastError ? "load failed");
 					currentFilePath = nil;
-					("Failed to load file: " ++ path).postln;
-				});
+				};
 			};
-		}).play;
+		});
 	}
 
 	resetGUI {
-		if(scheduler.isPlaying) {
-			scheduler.stop;
-		};
+		if(scheduler.isPlaying) { scheduler.stop };
 		this.stopLevelMonitoring;
 		trackViews.clear;
-		if(trackContainer.canvas.notNil) {
-			trackContainer.canvas.remove;
-		};
+		if(trackContainer.canvas.notNil) { trackContainer.canvas.remove };
 		playButton.value = 0;
+		recordButton.value = 0;
 	}
+
+	// ---- transport ---------------------------------------------------------------
 
 	play {
 		if(scheduler.play) {
 			playButton.value = 1;
 			this.startLevelMonitoring;
+			this.setStatus("playing");
+		} {
+			playButton.value = 0;
+			this.setStatus(scheduler.lastError ? "could not play");
 		};
 	}
 
@@ -384,84 +288,57 @@ EventSchedulerGUI {
 		scheduler.stop;
 		playButton.value = 0;
 		recordButton.value = 0;
-
 		this.resetMeters;
+		this.setStatus("stopped");
+	}
 
-		Routine({
-			0.3.wait;
-			AppClock.sched(0, {
-				if(currentFilePath.notNil) {
-					this.loadFile(currentFilePath);
-				};
-			});
-		}).play;
+	onSchedulerFinish {
+		this.setStatus("finished; ringing out");
+	}
+
+	onSchedulerIdle {
+		defer {
+			if(window.notNil and: { window.isClosed.not }) {
+				playButton.value = 0;
+				this.resetMeters;
+				this.setStatus("idle");
+			};
+		};
 	}
 
 	startRecording {
-		if(currentFilePath.notNil) {
-			var pathName = PathName(currentFilePath);
-			var dir = pathName.pathOnly;
-			var base = pathName.fileNameWithoutExtension;
-			// var outputPath = dir +/+ base ++ "_render";
-			var outputPath = dir +/+ base ++ ".wav";
-			var stems = stemsCheckbox.value;
-
-			recordButton.value = 1;
-
-			scheduler.recordingCompleteCallback = {
-				defer {
+		var pathName, dir, base, outputPath, stems;
+		if(currentFilePath.isNil) {
+			this.setStatus("No file loaded - cannot record");
+			recordButton.value = 0;
+			^this
+		};
+		pathName = PathName(currentFilePath);
+		dir = pathName.pathOnly;
+		base = pathName.fileNameWithoutExtension;
+		// Never <stem>.wav: that is the file's control-envelope buffer.
+		outputPath = dir +/+ (base ++ "_render.wav");
+		stems = stemsCheckbox.value;
+		recordButton.value = 1;
+		playButton.value = 1;
+		this.startLevelMonitoring;
+		scheduler.record(outputPath, stems, { |sched|
+			defer {
+				if(window.notNil and: { window.isClosed.not }) {
 					playButton.value = 0;
 					recordButton.value = 0;
-					"Recording complete".postln;
+					this.setStatus("recorded " ++ outputPath);
 				};
 			};
-
-			if(scheduler.isPlaying.not) {
-				playButton.value = 1;
-				scheduler.record(outputPath, stems, 15);
-			} {
-				// If already playing, need to restart with recording
-				this.stop;
-				Routine({
-					0.5.wait;
-					scheduler.recordingCompleteCallback = {
-						defer {
-							playButton.value = 0;
-							recordButton.value = 0;
-							"Recording complete".postln;
-						};
-					};
-					scheduler.record(outputPath, stems);
-				}).play;
-			};
-
-			("Recording to: " ++ outputPath).postln;
-		} {
-			"No file loaded - cannot record".postln;
-			recordButton.value = 0;
-		};
+		});
+		this.setStatus("recording to " ++ outputPath);
 	}
 
 	stopRecording {
-		recordButton.value = 0;
-		playButton.value = 0;
-		"Recording stopped".postln;
+		this.stop;
 	}
 
-	muteTrack { |trackName, isMuted|
-		("Track " ++ trackName ++ " muted: " ++ isMuted).postln;
-	}
-
-	soloTrack { |trackName, isSoloed|
-		("Track " ++ trackName ++ " soloed: " ++ isSoloed).postln;
-	}
-
-	setTrackGain { |trackName, gain|
-		var busSynth = scheduler.getBusSynth(trackName);
-		if(busSynth.notNil) {
-			busSynth.set(\gain, gain);
-		};
-	}
+	// ---- faders and meters ----------------------------------------------------------
 
 	sliderToDb { |value|
 		var amp;
@@ -488,37 +365,24 @@ EventSchedulerGUI {
 
 	startLevelMonitoring {
 		var peakValues;
-
 		this.stopLevelMonitoring;
-
-		if(scheduler.groupMap.isNil or: { server.serverRunning.not }) {
-			^nil;
-		};
-
-		peakValues = IdentityDictionary.new;
-
-		scheduler.groupMap.keysValuesDo { |trackName, entry|
-			peakValues[trackName] = 0;
-		};
+		if(server.serverRunning.not or: { trackOrder.size == 0 }) { ^nil };
+		peakValues = Dictionary.new;
+		trackOrder.do { |trackName| peakValues[trackName] = 0 };
 
 		OSCdef(\trackLevelMonitor, { |msg|
 			var level = msg[3];
 			var id = msg[4].asInteger;
-			var trackName = groupOrder[id];
-			if(trackName.notNil) {
-				peakValues[trackName] = level;
-			};
+			var trackName = trackOrder[id];
+			if(trackName.notNil) { peakValues[trackName] = level };
 		}, '/trackLevel', server.addr);
 
 		levelUpdateTask = Task({
 			var decayRate = 0.96;
 			loop {
 				if(scheduler.isPlaying.not) {
-					peakValues.keysValuesDo { |key, val|
-						peakValues[key] = val * decayRate;
-					};
+					peakValues.keysValuesDo { |key, val| peakValues[key] = val * decayRate };
 				};
-
 				defer {
 					trackViews.do { |trackData|
 						var level = peakValues[trackData.name] ? 0;
@@ -527,7 +391,6 @@ EventSchedulerGUI {
 						trackData.meterView.peakLevel = dbValue.linlin(-60, 0, 0, 1);
 					};
 				};
-
 				0.05.wait;
 			};
 		}).play;
@@ -538,20 +401,19 @@ EventSchedulerGUI {
 			levelUpdateTask.stop;
 			levelUpdateTask = nil;
 		};
-
 		OSCdef(\trackLevelMonitor).free;
-
 		this.resetMeters;
 	}
 
 	cleanup {
 		this.stopLevelMonitoring;
+		if(scheduler.isPlaying or: { scheduler.isRecording }) { scheduler.stop };
 		trackViews.clear;
-		groupOrder.clear;
+		trackOrder.clear;
 		window = nil;
 	}
 
 	close {
-		window.close;
+		if(window.notNil) { window.close };
 	}
 }
