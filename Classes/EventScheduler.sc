@@ -21,7 +21,7 @@
 //     one control block of its /s_new, would leave the voice hung (gate 0
 //     applied before EnvGen's first calc), so a gate release is never tagged
 //     before releaseGuard after its note, or lateReleaseGuard after the send
-//     of a note that went out with less than lateHorizon of lead.
+//     of a note that went out late (lateHorizon widens "late" to short leads).
 //   * new -> /s_new at the head of the track's src group with out = srcBus +
 //     speakerLane; releaseAfter + dur + a gated def -> /n_set gate 0 at
 //     start + dur; set -> /n_set (out re-pointed); release -> gate 0 on gated
@@ -88,7 +88,7 @@ EventScheduler {
 		maxBundleMsgs = 250;
 		releaseGuard = 0.003;
 		lateReleaseGuard = 0.05;
-		lateHorizon = 0.04;
+		lateHorizon = 0.0;
 		lateSlotHold = 0.03;
 		deferCount = 0;
 		guardCount = 0;
@@ -759,11 +759,14 @@ EventScheduler {
 					ledger.push(tt.max(sentAt + lateSlotHold));
 					late = sentAt > tt;
 					lateAny = lateAny or: late;
-					// scsynth treats a bundle that arrives within about one
-					// hardware callback of its tag as late too, and does not run
-					// the new node before the next callback: measured, a lead
-					// under 25 ms with a release inside the next 20 ms hangs the
-					// voice (tools/S/env_probe5.scd). So the guard keys on lead.
+					// A note sent after its tag is performed at scsynth's next
+					// drain, and a release reaching that same drain is applied
+					// before the voice's first calc, which hangs it. In a pair
+					// sent together the window is wider (a lead under 25 ms with
+					// the release inside the next 20 ms hangs, env_probe5.scd),
+					// but the stream only pairs a note with its release when it
+					// is catching up late; lateHorizon widens the trigger to
+					// short leads for a server where that proves otherwise.
 					b.do { |m|
 						if(m[0] == '/s_new') {
 							releaseNotBefore[m[2]] = if(sentAt > (tt - lateHorizon)) {

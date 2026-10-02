@@ -18,7 +18,7 @@ list::
 ## Sample names on code::buf*:: pfields are loaded into buffers once per file and substituted at send time.
 ::
 
-Every instant is sent as one time-tagged bundle (split by code::maxBundleBytes:: and code::maxBundleMsgs::, never inside one event's messages) code::latency:: seconds ahead, built as it goes. scsynth keeps at most 2048 time-tagged bundles per server and drops the next one silently, so an occupancy gate (link::Classes/KSQueueLoad::, the port of the browser engine's load tracker) keeps the bundles in flight under code::safeQueueLimit:: (1536) and waits for slots to come due before sending more: a flooded queue degrades to late delivery, never to lost notes. A gate release is never tagged within code::releaseGuard:: of its note's code::/s_new::, nor within code::lateReleaseGuard:: of the send of a note that went out with less than code::lateHorizon:: of lead, because a code::gate 0:: applied before the voice's first calc leaves it hung.
+Every instant is sent as one time-tagged bundle (split by code::maxBundleBytes:: and code::maxBundleMsgs::, never inside one event's messages) code::latency:: seconds ahead, built as it goes. scsynth keeps at most 2048 time-tagged bundles per server and drops the next one silently, so an occupancy gate (link::Classes/KSQueueLoad::, the port of the browser engine's load tracker) keeps the bundles in flight under code::safeQueueLimit:: (1536) and waits for slots to come due before sending more: a flooded queue degrades to late delivery, never to lost notes. A gate release is never tagged within code::releaseGuard:: of its note's code::/s_new::, nor within code::lateReleaseGuard:: of the send of a note that went out late, because a code::gate 0:: applied before the voice's first calc leaves it hung.
 
 CLASSMETHODS::
 
@@ -108,7 +108,7 @@ The most bytes (8192) and messages (250) in one bundle. An instant with more is 
 METHOD:: releaseGuard
 METHOD:: lateReleaseGuard
 METHOD:: lateHorizon
-The earliest a gate release may be tagged after its note's code::/s_new:: (0.003 s), and after the real send time of a note that went out with less than code::lateHorizon:: (0.04 s) of lead (0.05 s): scsynth does not run a node that arrives within about one hardware callback of its tag before the next callback, and a code::gate 0:: applied before the first calc leaves the voice hung.
+The earliest a gate release may be tagged after its note's code::/s_new:: (0.003 s), and after the real send time of a note that went out late (0.05 s): a late bundle's node is not run before scsynth's next drain, and a code::gate 0:: applied before the first calc leaves the voice hung. code::lateHorizon:: (default 0) widens "late" to any send with less than that much lead; measured in isolation, a note and release sent together with under 25 ms of lead hang, but the stream only sends them together when it is catching up late.
 
 METHOD:: lateSlotHold
 How long (0.03 s) a bundle that was already due when sent is still counted in the queue: scsynth performs it at its next hardware callback, not on arrival.
