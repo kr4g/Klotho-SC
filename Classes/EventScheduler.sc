@@ -9,8 +9,19 @@
 //   * play builds the topology (KSMixer) under one score group, sets up the
 //     control envelopes (one control bus per descriptor, preset with /c_set),
 //     then walks the send plan: events and envelope synths merged by start,
-//     one time-tagged bundle per distinct instant, sent `latency` seconds
-//     ahead. Nothing is ever dropped for being late or for being dense.
+//     one time-tagged bundle per distinct instant (split by maxBundleBytes and
+//     maxBundleMsgs, never inside one event's messages), sent `latency`
+//     seconds ahead and built as it goes, so a long file costs nothing up
+//     front. Nothing is ever dropped for being late or for being dense:
+//     scsynth holds at most queueSlots (2048) time-tagged bundles and drops
+//     the next one silently, so an occupancy gate (KSQueueLoad, the port of
+//     scheduler_core.js's _schedLoad) keeps the bundles in flight under
+//     safeQueueLimit and defers a send until slots come due (late delivery is
+//     the degradation, as in the browser). A late /s_new, or a release within
+//     one control block of its /s_new, would leave the voice hung (gate 0
+//     applied before EnvGen's first calc), so a gate release is never tagged
+//     before releaseGuard after its note, or lateReleaseGuard after the send
+//     of a note that went out with less than lateHorizon of lead.
 //   * new -> /s_new at the head of the track's src group with out = srcBus +
 //     speakerLane; releaseAfter + dur + a gated def -> /n_set gate 0 at
 //     start + dur; set -> /n_set (out re-pointed); release -> gate 0 on gated
@@ -27,6 +38,16 @@
 // outputs.
 
 EventScheduler {
+	// scsynth's scheduler: PriorityQueueT<SC_ScheduledEvent, 2048>, one slot
+	// per time-tagged bundle, freed when it comes due, the 2049th dropped with
+	// no message (research-scsynth-queue.md). 75 % of it is the working
+	// limit, the ratio scheduler_core.js uses (384 of SuperSonic's 512); the
+	// rest absorbs overshoot and other clients of the same server.
+	classvar <>queueSlots = 2048;
+	classvar <>safeQueueLimit = 1536;
+	classvar <>minBatchBundles = 25;      // defer when headroom is thinner than this
+	classvar <>maxBundlesPerSend = 200;   // bundles handed over between two gate checks
+	classvar <>deferMin = 0.02, <>deferMax = 0.25;
 	var <server;
 	var <assets, <payload, <mixer;
 	var <isPlaying, <isReady, <isRecording;
@@ -34,11 +55,13 @@ EventScheduler {
 	var <>loop, <output, <>stemTaps;
 	var <>onFinish, <>onIdle, <>onEvent, <>onLoad;
 	var <>oscTap, <>debug, <>enableMonitoring, <>allowUnknownDefs, <>postWarnings;
-	var <>maxBundleBytes;
+	var <>maxBundleBytes, <>maxBundleMsgs;
+	var <>releaseGuard, <>lateReleaseGuard, <>lateHorizon, <>lateSlotHold;
+	var <deferCount, <guardCount, releaseNotBefore;
 	var <>recordingCompleteCallback;
 	var <loadedFilePath, <lastError, <effectiveOutput, <pieceDur, <lastSentTag;
 	var <plan;
-	var stopToken, playRoutine, loadRoutine, recordRoutine, deferredRings;
+	var stopToken, playRoutine, loadRoutine, recordRoutine, deferredRings, firstCursor, firstBucket;
 	var nodeMap, defNameMap, warnedGroups, warnedBufs;
 	var <controlBusMap, controlGroup, controlBuses, ctrlBufnum, geomBufnum;
 	var recorders;
@@ -62,6 +85,14 @@ EventScheduler {
 		postWarnings = true;
 		allowUnknownDefs = false;
 		maxBundleBytes = 8192;
+		maxBundleMsgs = 250;
+		releaseGuard = 0.003;
+		lateReleaseGuard = 0.05;
+		lateHorizon = 0.04;
+		lateSlotHold = 0.03;
+		deferCount = 0;
+		guardCount = 0;
+		releaseNotBefore = Dictionary.new;
 		isPlaying = false;
 		isReady = false;
 		isRecording = false;
@@ -319,10 +350,12 @@ EventScheduler {
 		stopToken = stopToken + 1;
 		token = stopToken;
 		this.prCancelPlay;
-		playStart = thisThread.seconds + startupDelay;
-		this.prLog('#play', []);
+		playStart = nil;
 		nodeMap = Dictionary.new;
 		defNameMap = Dictionary.new;
+		releaseNotBefore = Dictionary.new;
+		deferCount = 0;
+		guardCount = 0;
 		warnedGroups = Set.new;
 		warnedBufs = Set.new;
 		try {
@@ -333,6 +366,15 @@ EventScheduler {
 			^false
 		};
 		pieceDur = payload.pieceDur;
+		// The first instant is built here, before playStart is fixed, so a
+		// first instant of thousands of notes (100 ms of sclang work) still
+		// goes out startupDelay ahead; every later instant is built when its
+		// send time comes. playStart is taken from the wall clock, which the
+		// build above has moved on while the logical clock stood still.
+		firstCursor = this.prCursor(this.prBuildSendPlan, 0, 0.0, this.prLoopState.notNil);
+		firstBucket = this.prNextBucket(firstCursor);
+		playStart = thisThread.seconds.max(Main.elapsedTime) + startupDelay;
+		this.prLog('#play', []);
 		isPlaying = true;
 		playRoutine = Routine({ this.prRun(token) }).play(SystemClock);
 		^true
@@ -384,12 +426,12 @@ EventScheduler {
 	}
 
 	// scheduler_core.js _buildSendPlan: events plus control items, stable-sorted
-	// by start, events before control items at an equal start.
+	// by start, events before control items at an equal start. Always sorted:
+	// the cursor walks the plan in time order, and a file need not be.
 	prBuildSendPlan {
 		var items = payload.events.collect { |ev| (kind: \event, start: ev.start, ev: ev) };
 		var ctrl = controlBusMap.collect { |cm| (kind: \ctrl, start: cm.start, cm: cm) };
 		var merged;
-		if(ctrl.size == 0) { ^items };
 		merged = items ++ ctrl;
 		merged.do { |it, i| it[\seq] = i };
 		^merged.sort { |a, b| (a.start < b.start) or: { (a.start == b.start) and: { a.seq < b.seq } } }
@@ -409,13 +451,25 @@ EventScheduler {
 		var sendPlan = this.prBuildSendPlan, running = true;
 		cycleDur = pieceDur + tailPause;
 		while { running } {
-			var buckets = this.prBuckets(sendPlan, cycle, relOffset, loopState.notNil);
-			buckets.do { |b|
-				var tt = playStart + b.time, delta;
+			var cursor, bucket;
+			if(cycle == 0 and: { firstCursor.notNil }) {
+				cursor = firstCursor;
+				bucket = firstBucket;
+				firstCursor = nil;
+				firstBucket = nil;
+			} {
+				cursor = this.prCursor(sendPlan, cycle, relOffset, loopState.notNil);
+				bucket = this.prNextBucket(cursor);
+			};
+			while { bucket.notNil } {
+				var tt = playStart + bucket.time, delta;
 				delta = (tt - latency) - thisThread.seconds;
 				if(delta > 0) { delta.wait };
 				if(token != stopToken) { ^nil };
-				this.prSendTimed(tt, b.msgs);
+				this.prSendTimed(tt, bucket.groups, token);
+				if(token != stopToken) { ^nil };
+				bucket.steps.do { |pair| this.prScheduleOnEvent(playStart + pair[0], pair[1]) };
+				bucket = this.prNextBucket(cursor);
 			};
 			if(loopState.isNil) {
 				running = false;
@@ -434,39 +488,81 @@ EventScheduler {
 		this.prFinishPlayback(token);
 	}
 
-	// One cycle's messages, grouped by time tag, in plan order. Carried items
+	// One cycle's send plan, walked one instant at a time (prNextBucket) so
+	// the per-event work (pfields, node ids, mappings) happens at send time
+	// and not in one block after playStart is fixed. Carried items
 	// (auto-releases, deferred maps) land in their own instant ahead of the
 	// events that start there, which is the browser's send order too.
-	prBuckets { |sendPlan, cycle, relOffset, looping|
-		var buckets = Dictionary.new, idPrefix = if(looping) { "c" ++ cycle ++ ":" } { nil };
-		var add = { |t, msg|
-			var key = (t * 1e9).round / 1e9, b = buckets[key];
-			if(b.isNil) { b = (time: t, msgs: List.new); buckets[key] = b };
-			b.msgs.add(msg);
+	prCursor { |sendPlan, cycle, relOffset, looping|
+		^(plan: sendPlan, idx: 0, relOffset: relOffset,
+			idPrefix: if(looping) { "c" ++ cycle ++ ":" } { nil },
+			carried: Dictionary.new, times: SortedList.new)
+	}
+
+	prKey { |t|
+		^(t * 1e9).round / 1e9
+	}
+
+	// The next instant, or nil when the cycle is spent. A bucket is
+	// (time:, groups:, steps:) where every group is one event's messages, kept
+	// together in one bundle because two bundles with one time tag may be run
+	// by scsynth in either order, and steps holds [time, stepIndex] pairs for
+	// onEvent, scheduled once the instant has been sent.
+	prNextBucket { |c|
+		var planT, planKey, carriedKey, key, bucket, group;
+		var add;
+		planT = if(c.idx < c.plan.size) { c.relOffset + c.plan[c.idx].start } { nil };
+		planKey = if(planT.notNil) { this.prKey(planT) } { nil };
+		carriedKey = if(c.times.isEmpty) { nil } { c.times.first };
+		if(planKey.isNil and: { carriedKey.isNil }) { ^nil };
+		if(carriedKey.notNil and: { planKey.isNil or: { carriedKey <= planKey } }) {
+			key = carriedKey;
+			c.times.removeAt(0);
+			bucket = c.carried.removeAt(key);
+		} {
+			key = planKey;
+			bucket = (time: planT, groups: List.new, steps: List.new);
 		};
-		sendPlan.do { |item|
-			var t = relOffset + item.start, cm, nid, ev, evId;
-			if(item.kind == \ctrl) {
-				cm = item.cm;
-				nid = this.nextNodeID;
-				add.value(t, ['/s_new', '__klEnvCtrl', nid, 0, cm.groupId,
-					'bufnum', cm.bufnum, 'bus', cm.bus, 'dur', cm.dur,
-					'startFrame', cm.startFrame, 'numFrames', cm.numFrames]);
-				cm[\nodeId] = nid;
+		add = { |t, msg|
+			var k = this.prKey(t), b;
+			if(k <= key) {
+				group.add(msg);
 			} {
-				ev = item.ev;
-				evId = if(idPrefix.notNil) { idPrefix ++ ev.id } { ev.id };
-				switch(ev.type,
-					"new", { this.prBundleNew(ev, evId, t, relOffset, add) },
-					"set", { this.prBundleSet(ev, evId, t, relOffset, add) },
-					"release", { this.prBundleRelease(ev, evId, t, add) }
-				);
-				if(ev.type == "new" and: { ev.stepIndex.notNil } and: { onEvent.notNil }) {
-					this.prScheduleOnEvent(playStart + t, ev.stepIndex);
-				};
+				b = c.carried[k];
+				if(b.isNil) { b = (time: t, groups: List.new, steps: List.new); c.carried[k] = b; c.times.add(k) };
+				b.groups.add(List[msg]);
 			};
 		};
-		^buckets.values.asArray.sort { |a, b| a.time < b.time }
+		while { c.idx < c.plan.size and: { this.prKey(c.relOffset + c.plan[c.idx].start) == key } } {
+			group = List.new;
+			this.prAddItem(c, c.plan[c.idx], add, bucket);
+			if(group.size > 0) { bucket.groups.add(group) };
+			c.idx = c.idx + 1;
+		};
+		^bucket
+	}
+
+	prAddItem { |c, item, add, bucket|
+		var t = c.relOffset + item.start, cm, nid, ev, evId;
+		if(item.kind == \ctrl) {
+			cm = item.cm;
+			nid = this.nextNodeID;
+			add.value(t, ['/s_new', '__klEnvCtrl', nid, 0, cm.groupId,
+				'bufnum', cm.bufnum, 'bus', cm.bus, 'dur', cm.dur,
+				'startFrame', cm.startFrame, 'numFrames', cm.numFrames]);
+			cm[\nodeId] = nid;
+		} {
+			ev = item.ev;
+			evId = if(c.idPrefix.notNil) { c.idPrefix ++ ev.id } { ev.id };
+			switch(ev.type,
+				"new", { this.prBundleNew(ev, evId, t, c.relOffset, add) },
+				"set", { this.prBundleSet(ev, evId, t, c.relOffset, add) },
+				"release", { this.prBundleRelease(ev, evId, t, add) }
+			);
+			if(ev.type == "new" and: { ev.stepIndex.notNil } and: { onEvent.notNil }) {
+				bucket.steps.add([t, ev.stepIndex]);
+			};
+		};
 	}
 
 	prScheduleOnEvent { |absTime, stepIndex|
@@ -611,27 +707,122 @@ EventScheduler {
 		^mappings
 	}
 
-	// One instant: as few bundles as the byte budget allows, every message
-	// time-tagged at exactly `tt`, logged in send order.
-	prSendTimed { |tt, msgs|
-		var bundles = List.new, cur = List.new, curSize = 16, late, sent, flags;
-		msgs.do { |m|
-			var sz = m.msgSize + 4;
-			if(cur.size > 0 and: { (curSize + sz) > maxBundleBytes }) {
-				bundles.add(cur);
+	// One instant: its groups packed into as few bundles as maxBundleBytes and
+	// maxBundleMsgs allow, every message time-tagged at exactly `tt`, logged in
+	// send order. Before each hand-over the occupancy gate prunes the ledger of
+	// bundles already due and, when fewer than minBatchBundles slots are free,
+	// waits for the earliest due one (20 ms to 250 ms, as the browser does)
+	// rather than sending into a full queue. A gate release whose node was
+	// sent late, or that falls within releaseGuard of its /s_new, is moved to
+	// its own bundle at the first safe tag.
+	prSendTimed { |tt, groups, token|
+		var ledger = KSQueueLoad.for(server), bundles, idx = 0, guarded = List.new, kept = List.new;
+		var sent, lateAny = false, stopped = false;
+		token = token ? stopToken;
+		groups.do { |g|
+			var keep = List.new;
+			g.do { |m|
+				var notBefore;
+				if(m[0] == '/n_set' and: { m.size == 4 } and: { m[2] == 'gate' } and: { m[3] == 0 }) {
+					notBefore = releaseNotBefore[m[1]];
+					if(notBefore.notNil and: { notBefore > (tt + 1e-9) }) {
+						guarded.add([notBefore, m]);
+					} {
+						keep.add(m);
+					};
+				} {
+					keep.add(m);
+				};
+			};
+			if(keep.size > 0) { kept.add(keep) };
+		};
+		bundles = this.prChunk(kept);
+		while { idx < bundles.size and: { stopped.not } } {
+			var now = Main.elapsedTime, load = ledger.prune(now), headroom = safeQueueLimit - load, n, earliest, waitTime;
+			if(headroom < minBatchBundles) {
+				earliest = ledger.peek;
+				waitTime = if(earliest.notNil) { (earliest - now).max(deferMin).min(deferMax) } { 0.1 };
+				deferCount = deferCount + 1;
+				this.prLog('#defer', [load, waitTime]);
+				waitTime.wait;
+				if(token != stopToken) { stopped = true };
+			} {
+				n = (bundles.size - idx).min(maxBundlesPerSend).min(headroom);
+				n.do {
+					var b = bundles[idx], sentAt, late;
+					server.sendBundle(tt - thisThread.seconds, *b);
+					sentAt = Main.elapsedTime;
+					// A bundle that is already due still takes a slot until the
+					// next hardware callback performs it, so a burst of late
+					// bundles must not be counted as free: hold its slot for
+					// lateSlotHold (one callback at any buffer size up to 1024).
+					ledger.push(tt.max(sentAt + lateSlotHold));
+					late = sentAt > tt;
+					lateAny = lateAny or: late;
+					// scsynth treats a bundle that arrives within about one
+					// hardware callback of its tag as late too, and does not run
+					// the new node before the next callback: measured, a lead
+					// under 25 ms with a release inside the next 20 ms hangs the
+					// voice (tools/S/env_probe5.scd). So the guard keys on lead.
+					b.do { |m|
+						if(m[0] == '/s_new') {
+							releaseNotBefore[m[2]] = if(sentAt > (tt - lateHorizon)) {
+								(sentAt + lateReleaseGuard).max(tt + releaseGuard)
+							} {
+								tt + releaseGuard
+							};
+						};
+					};
+					bundles[idx] = [b, late];
+					idx = idx + 1;
+				};
+			};
+		};
+		sent = thisThread.seconds - playStart;
+		bundles.copyRange(0, idx - 1).do { |pair|
+			var flags = if(pair[1]) { (late: true) } { nil };
+			pair[0].do { |m| this.prTap(tt - playStart, m[0], m.copyRange(1, m.size - 1), sent, flags) };
+		};
+		if(idx > 0 and: { lastSentTag.isNil or: { tt > lastSentTag } }) { lastSentTag = tt };
+		if(stopped) { ^this };
+		if(guarded.size > 0) {
+			// One bundle per 5 ms of guard tags, not one per release: a late
+			// 6000-note instant would otherwise cost 6000 queue slots here.
+			var byTag = Dictionary.new, tags = SortedList.new;
+			guarded.do { |pair|
+				var tag = (pair[0] / 0.005).ceil * 0.005, g = byTag[tag];
+				guardCount = guardCount + 1;
+				this.prLog('#releaseGuard', [pair[1][1], tt - playStart, tag - playStart]);
+				if(g.isNil) { g = List.new; byTag[tag] = g; tags.add(tag) };
+				g.add(List[pair[1]]);
+			};
+			tags.do { |tag| this.prSendTimed(tag, byTag[tag], token) };
+		};
+	}
+
+	// Bundles of whole groups: a group never straddles two bundles, a bundle
+	// never exceeds maxBundleBytes (one oversize group goes alone) or
+	// maxBundleMsgs. Every bundle is one scsynth queue slot.
+	prChunk { |groups|
+		var bundles = List.new, cur = List.new, curSize = 16;
+		groups.do { |g|
+			var sz = g.sum { |m| m.msgSize + 4 };
+			if(cur.size > 0 and: { ((curSize + sz) > maxBundleBytes) or: { (cur.size + g.size) > maxBundleMsgs } }) {
+				bundles.add(cur.asArray);
 				cur = List.new;
 				curSize = 16;
 			};
-			cur.add(m);
+			g.do { |m| cur.add(m) };
 			curSize = curSize + sz;
 		};
-		if(cur.size > 0) { bundles.add(cur) };
-		bundles.do { |b| server.sendBundle(tt - thisThread.seconds, *b.asArray) };
-		late = Main.elapsedTime > tt;
-		sent = thisThread.seconds - playStart;
-		flags = if(late) { (late: true) } { nil };
-		msgs.do { |m| this.prTap(tt - playStart, m[0], m.copyRange(1, m.size - 1), sent, flags) };
-		if(lastSentTag.isNil or: { tt > lastSentTag }) { lastSentTag = tt };
+		if(cur.size > 0) { bundles.add(cur.asArray) };
+		^bundles
+	}
+
+	// Bundles this player (and every other on the server) has in scsynth's
+	// queue right now, by the ledger.
+	queueLoad {
+		^KSQueueLoad.for(server).prune(Main.elapsedTime)
 	}
 
 	// ---- finish, ring-out, stop ---------------------------------------------------
@@ -784,7 +975,7 @@ EventScheduler {
 			};
 			token = stopToken;
 			stemRecs.do { |pair| pair[1].bus = mixer.trackInfo(pair[0]).fxBus.index };
-			recs.do { |r| this.prSendTimed(playStart, [r.startMessage(this.nextNodeID)]) };
+			recs.do { |r| this.prSendTimed(playStart, [List[r.startMessage(this.nextNodeID)]], token) };
 			stopAt = playStart + pieceDur + tailPause + ringTime + 0.1;
 			((stopAt - thisThread.seconds).max(0)).wait;
 			if(token != stopToken) { ^nil };

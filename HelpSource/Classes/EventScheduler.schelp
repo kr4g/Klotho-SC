@@ -18,9 +18,17 @@ list::
 ## Sample names on code::buf*:: pfields are loaded into buffers once per file and substituted at send time.
 ::
 
-Every instant is sent as one time-tagged bundle (split only by a byte budget) code::latency:: seconds ahead, so a dense instant of any size plays on time.
+Every instant is sent as one time-tagged bundle (split by code::maxBundleBytes:: and code::maxBundleMsgs::, never inside one event's messages) code::latency:: seconds ahead, built as it goes. scsynth keeps at most 2048 time-tagged bundles per server and drops the next one silently, so an occupancy gate (link::Classes/KSQueueLoad::, the port of the browser engine's load tracker) keeps the bundles in flight under code::safeQueueLimit:: (1536) and waits for slots to come due before sending more: a flooded queue degrades to late delivery, never to lost notes. A gate release is never tagged within code::releaseGuard:: of its note's code::/s_new::, nor within code::lateReleaseGuard:: of the send of a note that went out with less than code::lateHorizon:: of lead, because a code::gate 0:: applied before the voice's first calc leaves it hung.
 
 CLASSMETHODS::
+
+METHOD:: queueSlots
+METHOD:: safeQueueLimit
+METHOD:: minBatchBundles
+METHOD:: maxBundlesPerSend
+METHOD:: deferMin
+METHOD:: deferMax
+The occupancy gate, shared by every player: scsynth's queue size (2048), the working limit (1536), the headroom below which a send waits (25), the most bundles handed over between two checks (200) and the bounds of one wait (0.02 to 0.25 s).
 
 METHOD:: new
 ARGUMENT:: server
@@ -91,7 +99,24 @@ METHOD:: onLoad
 Callbacks. code::onEvent:: receives the code::_stepIndex:: of each note that carries one.
 
 METHOD:: oscTap
-Sees every message the player sends: a link::Classes/KSTrace:: (which writes the parity trace format) or a Function code::{ |t, addr, args, sent, flags| }::.
+Sees every message the player sends: a link::Classes/KSTrace:: (which writes the parity trace format) or a Function code::{ |t, addr, args, sent, flags| }::. Lifecycle lines code::#defer [load, wait]:: and code::#releaseGuard [node, from, to]:: report a deferred send and a moved release.
+
+METHOD:: maxBundleBytes
+METHOD:: maxBundleMsgs
+The most bytes (8192) and messages (250) in one bundle. An instant with more is split, between events.
+
+METHOD:: releaseGuard
+METHOD:: lateReleaseGuard
+METHOD:: lateHorizon
+The earliest a gate release may be tagged after its note's code::/s_new:: (0.003 s), and after the real send time of a note that went out with less than code::lateHorizon:: (0.04 s) of lead (0.05 s): scsynth does not run a node that arrives within about one hardware callback of its tag before the next callback, and a code::gate 0:: applied before the first calc leaves the voice hung.
+
+METHOD:: lateSlotHold
+How long (0.03 s) a bundle that was already due when sent is still counted in the queue: scsynth performs it at its next hardware callback, not on arrival.
+
+METHOD:: deferCount
+METHOD:: guardCount
+METHOD:: queueLoad
+How many sends the gate deferred and how many releases it moved in the current play, and the bundles the ledger currently counts in scsynth's queue.
 
 METHOD:: allowUnknownDefs
 When true, a def the SynthDescLib does not know is played anyway (treated as ungated) instead of refusing the file.

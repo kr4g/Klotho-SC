@@ -1,0 +1,26 @@
+TITLE:: KSQueueLoad
+summary:: The in-flight bundle ledger behind EventScheduler's occupancy gate
+categories:: Klotho
+related:: Classes/EventScheduler
+
+DESCRIPTION::
+scsynth keeps at most 2048 time-tagged bundles per server (one slot per bundle, freed when it comes due) and drops the next one on arrival with no message. The ledger records the due time of every timed bundle a player has sent and prunes the ones already due, so link::Classes/EventScheduler:: can see how many slots are taken before it sends more. One ledger per server address, shared by every player on it; emptied when the server quits.
+
+CLASSMETHODS::
+
+METHOD:: for
+The ledger of a server.
+
+INSTANCEMETHODS::
+
+METHOD:: push
+Record a bundle due at code::due:: (SystemClock seconds).
+
+METHOD:: prune
+Drop every entry due at or before code::now:: and return how many are still in flight.
+
+METHOD:: peek
+The earliest due time still recorded, or nil.
+
+METHOD:: count
+METHOD:: clear
