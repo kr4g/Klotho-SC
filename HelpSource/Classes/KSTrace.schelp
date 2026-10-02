@@ -1,0 +1,25 @@
+CLASS:: KSTrace
+summary:: An oscTap that records every message EventScheduler sends
+categories:: Scheduling
+related:: Classes/EventScheduler
+
+DESCRIPTION::
+Set as link::Classes/EventScheduler#-oscTap::, it keeps one record per OSC message (one per message of a bundle) plus the player's code::#:: lifecycle lines, and writes them as JSONL in the code::klotho-supersonic-trace/1:: format: code::{"t": tag - playStart | null, "addr", "args", "sent"}::, with code::late:: and code::purged:: flags. code::stop:: marks the bundles already handed to scsynth for later instants as purged. Such a trace is what the parity harness compares with the SuperSonic oracle's.
+
+CLASSMETHODS::
+
+METHOD:: new
+ARGUMENT:: path
+Where code::write:: puts the file.
+ARGUMENT:: header
+A Dictionary or Event written as the first line, code::{"header": {...}}::. Give it code::firstPrivateAudioBus::.
+
+INSTANCEMETHODS::
+
+METHOD:: tap
+The hook EventScheduler calls.
+
+METHOD:: markPurgedAfter
+METHOD:: records
+METHOD:: lines
+METHOD:: write

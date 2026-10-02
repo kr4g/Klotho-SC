@@ -1,0 +1,29 @@
+CLASS:: KSMixer
+summary:: The group, bus and insert topology of one EventScheduler play
+categories:: Scheduling
+related:: Classes/EventScheduler
+
+DESCRIPTION::
+Builds, message for message and in the same order as SuperSonic's code::setupTracks::, one score group at the head of the root node holding every track (parent, source group, effects group, two buses one channel per speaker), main last at the widest declared width, the insert chains or bypass routers, the summing routers, and main's output stage: the binaural decoder (code::\fold::), the hardware array mirror (code::\array::) or a stereo router. Frees exactly that group on stop or ring-out. Bus numbers come from the server's own allocator.
+
+INSTANCEMETHODS::
+
+METHOD:: spatialPlan
+Validate code::meta.spatial:: and decide widths, geometry and the output def. Every refusal throws before any node exists.
+
+METHOD:: build
+METHOD:: freeNow
+METHOD:: detach
+
+METHOD:: trackInfo
+Per track: code::parentGroup, srcGroup, fxGroup, srcBus, fxBus, width, insertNodes, routerNode::.
+
+METHOD:: gains
+METHOD:: mutes
+METHOD:: solos
+METHOD:: applyGain
+METHOD:: effectiveGain
+Router gains (fader, mute, solo) that persist across builds.
+
+METHOD:: setupStemTaps
+METHOD:: setupMeters

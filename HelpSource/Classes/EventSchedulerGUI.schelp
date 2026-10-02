@@ -1,0 +1,36 @@
+CLASS:: EventSchedulerGUI
+summary:: Transport and mixer window for EventScheduler
+categories:: GUI
+related:: Classes/EventScheduler
+
+DESCRIPTION::
+A window with Load, play/stop, record (with a Stems checkbox), a loop menu (off, infinite, 2, 4, 8 cycles) and an output menu (auto, array, fold), plus one strip per track of the loaded file (main last) with mute, solo, a dB label, a level meter, a fader on the track's router gain and the insert chain in order. Fader gains persist across plays. The window owns an link::Classes/EventScheduler:: created with code::enableMonitoring: true::.
+
+CLASSMETHODS::
+
+METHOD:: new
+ARGUMENT:: server
+Defaults to code::Server.default::.
+
+INSTANCEMETHODS::
+
+METHOD:: loadFile
+Load a Score.write file and rebuild the strips.
+
+METHOD:: play
+METHOD:: stop
+METHOD:: startRecording
+Transport. Recording writes code::<stem>_render.wav:: beside the loaded file (never the file's control-envelope code::.wav::).
+
+METHOD:: scheduler
+The underlying link::Classes/EventScheduler::.
+
+METHOD:: close
+
+EXAMPLES::
+code::
+s.boot;
+g = EventSchedulerGUI(s);
+{ g.scheduler.loadKlothoDefs }.fork;
+g.loadFile("piece.json");
+::

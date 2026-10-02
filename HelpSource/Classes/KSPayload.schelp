@@ -1,0 +1,47 @@
+CLASS:: KSPayload
+summary:: A decoded, validated Score.write file
+categories:: Scheduling
+related:: Classes/EventScheduler
+
+DESCRIPTION::
+Reads code::{"meta": {...}, "events": [...]}:: as Klotho's code::Score.write:: writes it and recovers the types by schema (code::String:parseJSON:: returns every scalar as a String): ids, group names, def names and speaker labels stay strings; starts, durations and pfield values become numbers; null stays nil. Reads the companion code::<stem>.wav:: control buffer and infers code::blockSize:: when code::meta.blockSize:: is absent. Every structural refusal throws an Error before the player has sent anything.
+
+CLASSMETHODS::
+
+METHOD:: read
+ARGUMENT:: path
+Path to the JSON file.
+
+METHOD:: resolveDefName
+The browser's rule: code::__rest__:: stays, nil or code::sonic-pi-beep:: becomes code::kl_tri::.
+
+METHOD:: companionWavPath
+code::Path(filepath).with_suffix('.wav')::.
+
+INSTANCEMETHODS::
+
+METHOD:: events
+Playable events (new, set, release) as Events with keys code::type, id, start, defName, dur, releaseAfter, pfields, group, speaker, speakerLane::. Read code::group:: with code::ev[\group]:: (code::Event:group:: is a method).
+
+METHOD:: groups
+METHOD:: inserts
+METHOD:: spatial
+METHOD:: descriptors
+The decoded code::meta:: sections.
+
+METHOD:: blockSize
+METHOD:: blockSizeSource
+METHOD:: controlFloats
+METHOD:: numFrames
+The control-envelope buffer.
+
+METHOD:: pieceDur
+code::max(start + dur):: over new and set events with a duration.
+
+METHOD:: isBare
+True when code::meta:: has none of code::groups::, code::inserts::, code::spatial::: the single-group path with code::out:: taken from the pfields.
+
+METHOD:: instrumentDefNames
+METHOD:: sampleNames
+METHOD:: notes
+What the file asks for, and soft problems found while reading it.

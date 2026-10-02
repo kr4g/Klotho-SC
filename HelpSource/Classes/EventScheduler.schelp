@@ -1,194 +1,133 @@
 CLASS:: EventScheduler
-summary:: Event scheduler with group management and effect chains
-categories:: Scheduling, Live Coding
-related:: Classes/TempoClock, Classes/SystemClock, Classes/Synth
+summary:: Plays a Klotho Score.write file with the semantics of Klotho's SuperSonic engine
+categories:: Scheduling, External Control
+related:: Classes/EventSchedulerGUI, Classes/KSPayload, Classes/KSAssets, Classes/KSMixer, Classes/KSTrace
 
 DESCRIPTION::
-EventScheduler is a comprehensive event scheduling system for SuperCollider that supports:
-- Loading events from JSON/YAML files
-- Automatic group and bus management
-- Effect chain insertion per group
-- Batch event scheduling with overlap
-- Multi-track recording (stems)
-- Real-time event scheduling
+EventScheduler loads the JSON file that Klotho's code::Score.write:: produces and plays it on a native scsynth exactly the way Klotho's browser engine (SuperSonic, code::scheduler_core.js:: and code::scheduler_score.js::) plays the same score:
+
+list::
+## code::defName:: on each event (code::synthName:: is accepted as a fallback); a missing name or code::sonic-pi-beep:: plays code::kl_tri::, code::__rest__:: plays nothing.
+## Tracks from code::meta.groups::, each with a source group, an effects group and two buses; code::main:: last; code::"default":: and any unknown group name play on main, with one warning per unknown name.
+## Insert chains from code::meta.inserts::, wired with code::inBus::/code::outBus::, intermediate buses as wide as the chain, and a bypass router on a track without inserts. A code::set:: event addressed to an insert's code::uid:: sets that node.
+## Auto-release: an event with code::releaseAfter:: and a positive code::dur:: on a def that has a code::gate:: control gets code::/n_set gate 0:: at code::start + dur::. Gate presence is read from the compiled SynthDef through link::Classes/SynthDescLib::.
+## Control envelopes from code::meta.controlEnvelopes:: and the companion code::<stem>.wav::: one control bus per descriptor preset with code::/c_set::, one code::__klEnvCtrl:: synth per descriptor at its start, code::/n_map:: on every target and pfield (deferred to code::startTime:: when later than the event). code::blockSize:: comes from code::meta.blockSize::, or is inferred as frames / descriptors.
+## Spatial routing from code::meta.spatial::: width-N routers, main as wide as the widest array, code::out = srcBus + speakerLane::, and either the binaural fold (code::__spatialDecodeN:: with the geometry buffer) or the hardware array (code::__spatialArrayOutN::). Widths outside Klotho's precompiled family (1, 2, 4, 6, 8, 12, 16, 24, 32) are refused before any node exists.
+## Finish at code::max(start + dur) + tailPause:: (code::onFinish::), the score group freed code::ringTime:: later, code::onIdle:: after that. code::stop:: frees only this player's score group: nothing else on the server is touched and no CmdPeriod runs.
+## code::loop::: code::true:: or an integer number of cycles.
+## Sample names on code::buf*:: pfields are loaded into buffers once per file and substituted at send time.
+::
+
+Every instant is sent as one time-tagged bundle (split only by a byte budget) code::latency:: seconds ahead, so a dense instant of any size plays on time.
 
 CLASSMETHODS::
 
 METHOD:: new
-Create a new EventScheduler instance.
-
 ARGUMENT:: server
-The server to use. Defaults to Server.default.
-
-ARGUMENT:: maxEvents
-Maximum events per batch. Default is 500.
-
-ARGUMENT:: batchOverlapRatio
-Overlap ratio between batches (0.0-1.0). Default is 0.8.
-
-ARGUMENT:: startLag
-Lag time before starting playback. Default is 0.5 seconds.
-
+The server to play on. Defaults to code::Server.default::.
+ARGUMENT:: startupDelay
+Seconds between code::play:: and the first event. Default 0.1, as in the browser.
+ARGUMENT:: latency
+How far ahead bundles are sent. Default code::server.latency::.
+ARGUMENT:: ringTime
+Seconds the score group stays alive after the piece ends. Default 5.
+ARGUMENT:: enableMonitoring
+Adds a level tap per track that sends code::/trackLevel:: (for the GUI's meters).
 ARGUMENT:: debug
-Enable debug logging. Default is false.
-
-returns:: A new EventScheduler instance.
+Posts debug lines.
 
 INSTANCEMETHODS::
 
 METHOD:: loadFile
-Load events from a JSON or YAML file.
-
+Load a Score.write file in a Routine of its own; every refusal (unreadable file, a SynthDef the server does not have, a bad spatial width, a control buffer that does not divide into blocks) happens here. Also uploads the control-envelope buffer, the decoder geometry and the sample buffers.
 ARGUMENT:: path
-Path to the file containing event data.
+Path to the JSON file. The control buffer is read from the same path with a code::.wav:: extension.
+ARGUMENT:: action
+Called with code::(success, scheduler):: when the load is done.
 
-returns:: Boolean indicating success.
+METHOD:: loadFileSync
+The same, from inside a Routine. Returns a Boolean.
 
-The file should have this structure:
-code::
-{
-  "meta": {
-    "groups": ["drums", "bass", "lead"],
-    "inserts": {
-      "drums": [
-        {"uid": "compressor", "synthName": "Compressor", "args": {"ratio": 4}}
-      ],
-      "main": [
-        {"uid": "reverb", "synthName": "FreeVerb", "args": {"mix": 0.3}}
-      ]
-    }
-  },
-  "events": [
-    {
-      "type": "new",
-      "id": "leadSynth",
-      "start": 0.0,
-      "synthName": "varSaw",
-      "group": "lead",
-      "pfields": {"freq": 440, "amp": 0.8}
-    },
-    {
-      "type": "set",
-      "id": "leadSynth",
-      "start": 0.5,
-      "pfields": {"freq": 462}
-    },
-    {
-      "type": "release",
-      "id": "leadSynth",
-      "start": 1.0
-    }
-  ]
-}
-::
+METHOD:: loadSynthDefDir
+Load every code::.scsyndef:: in a directory into the server and into link::Classes/SynthDescLib:: (so gate presence is known). Syncs when called inside a Routine.
+
+METHOD:: loadKlothoDefs
+Load Klotho's own bundled SynthDefs (code::assets/synthdefs/{infra,instruments,effects}::) from link::Classes/KSAssets#*klothoAssetsDir::.
 
 METHOD:: play
-Start event playback.
-
-returns:: Boolean indicating success.
+Build the topology and start playback. Returns a Boolean. Playing while a previous play is live or ringing out frees that play first.
 
 METHOD:: stop
-Stop playback and free all nodes.
-
-returns:: Boolean indicating success.
+Stop now. Frees this play's score group, buses and control buses, nothing else; fires no callback.
 
 METHOD:: record
-Record the performance to audio file(s).
-
+Record one pass of the loaded file to disk: the main output (N channels in code::\array:: mode, 2 in code::\fold::) to code::path::, plus one file per track when code::stems:: is true (code::<base>_<track>.<ext>::, at the track's width). The output path may not be the file's own control-envelope code::.wav::.
 ARGUMENT:: path
-Output file path. For stems, this becomes the base name.
-
+Output file.
 ARGUMENT:: stems
-Whether to record individual group stems. Default is true.
+Also write per-track files.
+ARGUMENT:: onComplete
+Called when the files are closed.
 
-ARGUMENT:: end_padding
-Extra time to record after the last event. Default is 5.0 seconds.
+METHOD:: output
+code::\array:: (hardware outputs 0..N-1), code::\fold:: (binaural decode onto outputs 0/1) or code::nil:: for automatic: code::\array:: when the server has at least N outputs. Changing it after a load reloads the file.
 
-returns:: Boolean indicating success.
+METHOD:: loop
+code::false::, code::true:: (until stop) or an integer number of cycles.
 
+METHOD:: ringTime
+METHOD:: tailPause
+METHOD:: latency
+METHOD:: startupDelay
+Timing parameters, in seconds.
+
+METHOD:: stemTaps
+When true, one stereo router per non-main track mirrors its post-fader bus onto hardware outputs 2+2i (the browser's stem capture layout).
+
+METHOD:: onFinish
+METHOD:: onIdle
+METHOD:: onEvent
+METHOD:: onLoad
+Callbacks. code::onEvent:: receives the code::_stepIndex:: of each note that carries one.
+
+METHOD:: oscTap
+Sees every message the player sends: a link::Classes/KSTrace:: (which writes the parity trace format) or a Function code::{ |t, addr, args, sent, flags| }::.
+
+METHOD:: allowUnknownDefs
+When true, a def the SynthDescLib does not know is played anyway (treated as ungated) instead of refusing the file.
+
+METHOD:: setTrackGain
+METHOD:: muteTrack
+METHOD:: soloTrack
+Router gains for the GUI; they persist across plays.
+
+METHOD:: trackNames
+METHOD:: insertNames
 METHOD:: status
-Print current status information.
-
-METHOD:: hasNode
-Check if a node ID is currently active.
-
-ARGUMENT:: nodeId
-The node ID to check.
-
-returns:: Boolean.
-
-METHOD:: debug
-Get/set debug mode.
-
-ARGUMENT:: value
-Boolean to enable/disable debug logging.
-
-SUBSECTION:: Event Types
-
-The scheduler supports these event types:
-
-DEFINITIONLIST::
-## "new"
-|| Create a new synth with the specified synthName and pfields
-## "set"
-|| Set parameters on an existing node
-## "release"
-|| Release an existing node
-## "message"
-|| Print a message (for debugging)
-::
-
-SUBSECTION:: Groups and Effects
-
-Groups are automatically created based on the "groups" array in the meta section. Each group has:
-- A source group for synths
-- An effects group for processing
-- Source and effects buses
-- Automatic routing between groups
-
-Effects are specified in the "inserts" section and are automatically instantiated with proper bus routing.
+METHOD:: payload
+METHOD:: mixer
+METHOD:: assets
+Introspection.
 
 EXAMPLES::
 
 code::
-// Basic usage
-e = EventScheduler.new(debug: true);
-e.loadFile("path/to/events.json");
-e.play;
-
-// Record with stems
-e.record("output/mypiece.wav", stems: true);
-
-// Stop playback
+s.boot;
+e = EventScheduler(s);
+{ e.loadKlothoDefs; }.fork;          // Klotho's bundled defs, or e.loadSynthDefDir("path/to/compiled")
+e.loadFile("piece.json", { |ok| if(ok) { e.play } });
 e.stop;
 
-// Check status
-e.status;
+// a 24-speaker file on a 24-output interface
+e.output = \array;
+e.loadFile("spatial_piece.json", { |ok| if(ok) { e.record("spatial_piece_render.wav", stems: true) } });
+
+// trace every message in the parity format
+t = KSTrace("trace.jsonl", (source: "native", firstPrivateAudioBus: s.options.firstPrivateBus));
+e.oscTap = t;
+e.onIdle = { t.write };
 ::
 
-code::
-// Minimal event file structure
-{
-  "meta": {
-    "groups": ["lead"]
-  },
-  "events": [
-    {
-      "type": "new",
-      "id": "note1",
-      "start": 0.0,
-      "synthName": "default",
-      "group": "lead",
-      "pfields": {"freq": 440, "amp": 0.5}
-    }
-  ]
-}
-::
+SECTION:: The file
 
-SECTION:: Implementation Notes
-
-- Events are scheduled in batches to handle large sequences efficiently
-- The batchOverlapRatio controls when the next batch begins relative to the current batch duration
-- All buses are stereo (2 channels)
-- Groups automatically route to the main output
-- Node management includes automatic cleanup on synth release
+code::{"meta": {...}, "events": [...]}:: as code::Score.write:: writes it. code::meta:: may carry code::groups::, code::inserts::, code::spatial::, code::controlEnvelopes::, and (from the native-player contract) code::blockSize::, code::defNames::, code::defs:: and code::samples::. Events carry code::type:: (new, set, release), code::id::, code::start::, code::defName::, code::dur::, code::releaseAfter::, code::pfields::, code::group::, code::speaker:: and code::speakerLane::. All times are seconds.

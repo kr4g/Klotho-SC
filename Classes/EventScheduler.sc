@@ -213,6 +213,12 @@ EventScheduler {
 			widths.do { |w| assets.ensureWidthFamily(w) };
 		};
 		if(p.isBare.not) { assets.ensureWidthFamily(2) };
+		// Defs the GUI's meter taps need, defined now so the load's final sync
+		// lands them before play sends the first /s_new (/d_recv is async).
+		if(enableMonitoring) {
+			assets.ensureMeter(2);
+			widths !? { widths.do { |w| assets.ensureMeter(w) } };
+		};
 
 		plan = try { mixer.spatialPlan(p, effectiveOutput) } { |e| err = e; \refused };
 		if(plan == \refused) {

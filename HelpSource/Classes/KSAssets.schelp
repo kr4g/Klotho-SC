@@ -1,0 +1,35 @@
+CLASS:: KSAssets
+summary:: SynthDefs, gate knowledge and sample buffers for EventScheduler
+categories:: Scheduling
+related:: Classes/EventScheduler, Classes/SynthDescLib
+
+DESCRIPTION::
+Loads compiled SynthDefs into a server and into link::Classes/SynthDescLib:: (so the controls, including code::gate::, are known), answers the gate question for auto-release, and loads sample buffers. When Klotho's assets are not loaded, the infrastructure defs the player needs (code::__busRouter::, code::__klEnvCtrl::, the width families) are built in sclang from the same source Klotho compiles them from, at the widths Klotho precompiles (1 2 4 6 8 12 16 24 32) and no others.
+
+CLASSMETHODS::
+
+METHOD:: klothoAssetsDir
+Where Klotho's code::assets:: folder is. Default code::~/Klotho/klotho/utils/playback/supersonic/assets::.
+
+METHOD:: new
+ARGUMENT:: server
+
+INSTANCEMETHODS::
+
+METHOD:: loadSynthDefDir
+Load every code::.scsyndef:: under a directory (code::/d_loadDir::) and read its SynthDescs. Syncs when called inside a Routine.
+
+METHOD:: loadKlothoDefs
+Load code::synthdefs/{infra,instruments,effects}:: under the assets folder.
+
+METHOD:: hasDef
+METHOD:: isGated
+METHOD:: missingDefs
+Gate presence comes from the compiled def, then from the file's code::meta.defs[name].gate::, then "ungated".
+
+METHOD:: samplePaths
+A code::name -> path:: map for samples the file does not describe. Resolution order: the file's code::meta.samples::, this map, Klotho's bundled code::samples.json::.
+
+METHOD:: loadSamples
+METHOD:: freeSamples
+METHOD:: sampleMap
